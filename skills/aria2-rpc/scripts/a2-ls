@@ -1,0 +1,68 @@
+#!/bin/bash
+# 浏览 AList 中的目录和文件
+# 用法: a2-ls [AList路径]
+# 示例: a2-ls /aliyun
+#       a2-ls /aliyun/长安的荔枝
+
+ALIST_URL="http://localhost:5244"
+USERNAME="admin"
+PASSWORD_FILE="$HOME/.alist/admin_password.txt"
+PATH_TO_LIST="${1:-/}"
+
+# 读取密码
+if [ -f "$PASSWORD_FILE" ]; then
+    PASSWORD=$(grep -o 'password: [^ ]*' "$PASSWORD_FILE" | tail -1 | awk '{print $2}')
+else
+    read -s -p "AList 管理员密码: " PASSWORD
+    echo ""
+fi
+
+# 登录
+TOKEN=$(curl -s -X POST "$ALIST_URL/api/auth/login" \
+  -H "Content-Type: application/json" \
+  -d "{\"username\":\"$USERNAME\",\"password\":\"$PASSWORD\"}" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['token'])" 2>/dev/null)
+
+if [ -z "$TOKEN" ]; then
+    echo "登录失败"
+    exit 1
+fi
+
+# 列出目录
+curl -s -X POST "$ALIST_URL/api/fs/list" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: $TOKEN" \
+  -d "{\"path\":\"$PATH_TO_LIST\",\"password\":\"\",\"page\":1,\"per_page\":200,\"refresh\":false}" | python3 -c "
+import sys,json
+d = json.load(sys.stdin)
+if d['code'] != 200:
+    print(f'错误: {d[\"message\"]}')
+    sys.exit(1)
+
+content = d['data']['content']
+if not content:
+    print('（目录为空）')
+    sys.exit(0)
+
+# 分离目录和文件
+dirs = sorted([f for f in content if f['is_dir']], key=lambda x: x['name'])
+files = sorted([f for f in content if not f['is_dir']], key=lambda x: x['name'])
+
+def fmt_size(size):
+    if size > 1073741824:
+        return f'{size/1073741824:>7.2f}GB'
+    elif size > 1048576:
+        return f'{size/1048576:>7.2f}MB'
+    elif size > 1024:
+        return f'{size/1024:>7.1f}KB'
+    else:
+        return f'{size:>7}B'
+
+print(f'📁 $PATH_TO_LIST  ({len(dirs)} 个目录, {len(files)} 个文件)')
+print('-' * 60)
+
+for f in dirs:
+    print(f'  [DIR]  {f[\"name\"]}')
+
+for f in files:
+    print(f'  [FILE] {fmt_size(f[\"size\"])}  {f[\"name\"]}')
+"

@@ -1,0 +1,1227 @@
+#!/usr/bin/env python3
+"""a2 —— aria2 RPC 命令行封装（macOS / Linux / Windows 通用；配套 .sh 脚本在 Windows 上用 WSL 或 Git Bash）。
+端口与密钥自动从 ~/.aria2/aria2.conf 读取。
+
+用法:
+  a2 add [-p] [-m|-t|-P|-flat|-d 目录] [-o 文件名] <url|magnet|file.torrent|urls.txt> ...
+        -m 强制当电影(→媒体库/Movies)   -t 强制当剧集(→媒体库/TV)
+        -P 强制当私藏(→媒体库/Private；不看名字，成人/私藏资源走这个)
+        -d DIR 指定任意保存目录（直接落 DIR，不进暂存区、不会被自动改名/入库）
+        -flat 强制落 conf 里的默认下载目录（不进媒体库）  -p 加入后先暂停  -o 指定保存文件名
+        默认：名字里像电影/剧集（S01E02、1x02、第03集、第二季、第1-4季、全24集、合集、年份+1080p 等）
+        → 进媒体库暂存区（${A2_MEDIA_ROOT}/.incoming），完成后自动入库；普通文件（zip/pdf/iso…）落 conf
+        的默认下载目录（默认 ~/Downloads，可用 A2_DOWNLOAD_DIR 覆盖）；
+        裸磁力（只有 btih、无名称）先落 .incoming/_unsorted，下载完按实际文件名判断后入库
+  空间保护：目标盘剩余 < 20GB 时拒绝加任务（可用 A2_MIN_FREE_GB=5 临时放宽）
+  a2 sweep              手动把暂存区里已完成但没自动入库的文件搬进媒体库
+  a2 ls [-a]            任务列表（默认活动+等待，-a 含已结束）
+  a2 st                 全局速率/任务数
+  a2 info <gid>         单任务详情
+  a2 files <gid>        任务内文件列表
+  a2 pause [force] <gid|all>   暂停（加 force = 立即中断当前分片）  a2 resume <gid|all>  继续
+  a2 rm <gid|all>       移除任务（不删已下文件）  a2 purge  清空已结束列表
+  a2 up <rate|0>        上传限速（如 1M / 0=不限）  a2 down <rate|0>  下载限速
+  a2 find <关键词> [--pages N] [--min-seeds N] [--res 1080p] [--prefer 组A,组B] [--all]
+                   [--refresh] [--json]
+        搜索种子。**不内置任何站点**：a2 调用你自己配置的「搜索源命令」（a2.conf 里的
+        tor-source-cmd，或环境变量 A2_TOR_CMD），源命令把结果以 JSON 打到 stdout。
+        字段契约、示例与排查：references/tor-source.md；随附 tor-source-demo.py（离线自测，
+        不联网即可跑通 find/grab）与 tor-source-template.py（接入自己站点的骨架）。
+        默认过滤（只看标题/分类，与源无关）：电影分类全留（单片没有「整季」概念）；剧集分类要求
+        命中「整季/全集」且不是单集 SxxExx；噪音（3D/SBS/Hindi/FLAC/电子书）剔除；--all 全关。
+        结果按做种数排序，--prefer 里的压制组排最前。源返回 0 条、超时、报错都会明确报出来，
+        绝不会因为源挂了而显示成「没有结果」。
+        缓存 ~/.aria2/find-cache.json（只存源返回的原始行，换过滤参数不互相污染），
+        grab 的序号按「过滤+排序后的视图」取。
+  a2 grab <序号|标题片段|infohash|磁力> [-t|-m|-P|-flat|-d 目录] [-p] [-o 文件名] [--no-verify]
+        取该条的磁力 → 默认先用 bt-metadata-only 拉真实元数据校验（有些源标的做种数会撒谎：
+        标着 seeds 5 的种子可能一个字节元数据都拉不到），通过才入库；--no-verify 跳过校验。
+gid 可用前 6 位以上的前缀；限速改动只在本次运行有效，持久化请改 conf 后重启守护。
+媒体落点：${A2_MEDIA_ROOT}/{Movies,TV,Private}（默认 ~/media），下载中暂存 ${A2_MEDIA_ROOT}/.incoming/…。
+搜索源自己负责限流与重试：a2 每页只调用一次源命令，并把关键词/页码传给它（A2_QUERY/A2_PAGE/A2_PAGES）。
+"""
+import base64, hashlib, json, os, re, shutil, subprocess, sys, time
+import urllib.error, urllib.parse, urllib.request
+
+CONF = os.path.expanduser(os.environ.get("A2_CONF", "~/.aria2/aria2.conf"))   # 测试/多实例可换
+# a2 自己的配置（搜索源、服务名…）。**不要把这些键写进 aria2.conf**：aria2 不认识的键会打
+# `[WARN] Unknown option: …`（无害但每次启动都刷屏），所以 a2 的专有配置单独放一个文件。
+RC = os.path.expanduser(os.environ.get("A2_RC", "~/.aria2/a2.conf"))
+
+
+def key_get(path, key, default):
+    try:
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if line.startswith(key + "="):
+                    return line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return default
+
+
+def conf_get(key, default):
+    """读 aria2.conf（端口/密钥/下载目录这些 aria2 自己的选项）。"""
+    return key_get(CONF, key, default)
+
+
+def rc_get(key, default):
+    """读 a2.conf（a2 专有配置）。"""
+    return key_get(RC, key, default)
+
+# ffprobe 常见安装位置（跨平台兜底；同样适用于没配好 PATH 的服务管理器）
+FFPROBE_CANDIDATES = (
+    "/opt/homebrew/bin/ffprobe",            # macOS (Apple Silicon, Homebrew)
+    "/usr/local/bin/ffprobe", "/usr/bin/ffprobe",   # macOS Intel / Homebrew / 发行版包管理
+    "/snap/bin/ffprobe", "/var/lib/flatpak/exports/bin/ffprobe",   # Linux 通用包
+    os.path.join(os.path.expanduser("~"), "scoop", "shims", "ffprobe.exe"),   # Windows scoop
+    r"C:\ProgramData\chocolatey\bin\ffprobe.exe",                             # Windows choco
+    r"C:\Program Files\ffmpeg\bin\ffprobe.exe",                               # Windows 手动解压
+)
+
+
+def find_ffprobe():
+    """找 ffprobe：先 PATH，再常见安装位置；找不到返回 None。"""
+    p = shutil.which("ffprobe")
+    if p:
+        return p
+    for c in FFPROBE_CANDIDATES:
+        if os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    return None
+
+
+# ---------- 跨平台小工具（macOS / Linux / Windows 通用，不做任何系统特有假设）----------
+
+def _same_device(a, b):
+    """两个路径是否在同一存储设备上（POSIX 看 st_dev；Windows 上 st_dev 是卷标识）。"""
+    try:
+        return os.stat(a).st_dev == os.stat(b).st_dev
+    except OSError:
+        return False
+
+
+def path_target_ok(path):
+    """目标路径当前能不能用。返回 (ok, 原因)。
+
+    放行：
+      - 路径已存在（是目录时要求可写）；
+      - 路径在**家目录内**（把媒体库放系统盘上是正常选择）；
+      - 路径落在与家目录**不同的存储设备**上（外接盘/网络盘/另一个分区，OK）；
+      - 显式设了 A2_ALLOW_CREATE=1。
+    拒绝：
+      - 路径不存在、又既不在家目录内、还会被创建在**家目录所在的那块盘**上 ——
+        这正是外接盘/网络盘没挂载时挂载点目录消失的样子（例：/mnt/usb/media、D:\media、
+        以及任意"挂载点凭空消失"的场景），继续下去会把几十 GB 悄悄写进系统盘。
+
+    判据只用 st_dev 与家目录比较（POSIX 与 Windows 都成立），不写死任何平台的挂载点前缀。
+    """
+    p = os.path.abspath(os.path.expanduser(path))
+    if os.path.exists(p):
+        if os.path.isdir(p) and not os.access(p, os.W_OK):
+            return False, "%s 存在但不可写" % p
+        return True, ""
+    if os.environ.get("A2_ALLOW_CREATE") == "1":
+        return True, ""
+    home = os.path.abspath(os.path.expanduser("~"))
+    if p == home or p.startswith(home.rstrip(os.sep) + os.sep):
+        return True, ""                                     # 家目录内：系统盘也放行
+    anc = p
+    while not os.path.exists(anc):
+        parent = os.path.dirname(anc)
+        if not parent or parent == anc:
+            break
+        anc = parent
+    if not os.path.exists(anc):
+        return False, "%s 所在位置不可用（盘符/挂载点不存在）" % p
+    if not _same_device(anc, home):
+        return True, ""                                     # 落在别的盘上：放行
+    return False, ("%s 不存在，且会被创建到系统盘上（外接盘/网络盘多半没挂载）" % p)
+
+HINT_CREATE = ("若该路径本来就该建在系统盘上：先 mkdir -p 它，或设 A2_ALLOW_CREATE=1 再试。")
+
+
+LAST_PATH_REASON = [""]
+
+
+PORT = conf_get("rpc-listen-port", "6800")
+SECRET = os.environ.get("A2_SECRET") or conf_get("rpc-secret", "")
+URL = "http://127.0.0.1:%s/jsonrpc" % PORT
+# 服务名：只用于提示信息；与 install-a2.sh 的 A2_SERVICE / a2.conf 的 service= 保持一致
+SERVICE = os.environ.get("A2_SERVICE") or rc_get("service", "com.example.aria2")
+
+
+def service_restart_hint():
+    """各平台的服务管理命令（只用于提示信息）。"""
+    if sys.platform == "darwin":
+        return "launchctl kickstart -k gui/$(id -u)/%s" % SERVICE
+    if os.name == "nt":
+        return "schtasks /End /TN %s 然后 schtasks /Run /TN %s" % (SERVICE, SERVICE)
+    return "systemctl --user restart %s" % SERVICE
+
+
+def service_status_hint():
+    if sys.platform == "darwin":
+        return "launchctl print gui/$(id -u)/%s" % SERVICE
+    if os.name == "nt":
+        return "schtasks /Query /TN %s /V" % SERVICE
+    return "systemctl --user status %s" % SERVICE
+
+# ---------- 入库文件名清洗（去站点广告；与 on-complete.py 共用同一份规则）----------
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+try:
+    from nameclean import clean_name, clean_tree
+except Exception:                                    # 模块缺失也不能影响基本功能
+    def clean_name(n):
+        return n
+
+    def clean_tree(path, depth=2, log=None):
+        return []
+
+# ---------- 媒体落点：电影/剧集 → 媒体库根（A2_MEDIA_ROOT），其余仍落 conf 里的 dir ----------
+# 媒体库根含 Movies/TV/Private 三个子目录，需用户自行创建；默认 ~/media，可用环境变量覆盖
+MEDIA_ROOT = os.path.expanduser(os.environ.get("A2_MEDIA_ROOT", "~/media"))
+MOVIE_DIR = MEDIA_ROOT + "/Movies"
+TV_DIR = MEDIA_ROOT + "/TV"
+PRIVATE_DIR = MEDIA_ROOT + "/Private"     # 私藏库（-P）；也是 Jellyfin 库根，只放完整条目
+STAGING = MEDIA_ROOT + "/.incoming"          # 下载中先落这里，完成后由 on-complete.py 搬进库目录
+VIDEO_EXT = (".mkv", ".mp4", ".avi", ".ts", ".m2ts", ".mov", ".wmv", ".flv",
+             ".rmvb", ".mpg", ".m4v")
+TV_RE = re.compile(r"(?i)(s\d{1,2}[\s._-]*e\d{1,3}|(?<!\d)\d{1,2}x\d{2}(?!\d)|"
+                   r"第\s?[\d一二三四五六七八九十]{1,3}\s?[-~—至]?\s?[\d一二三四五六七八九十]{0,3}\s?[集話话期季]|"
+                   r"[全共]\s?[\d一二三四五六七八九十]{0,4}\s?[集季]|合集|season[\s._-]?\d|"
+                   r"\bep\s?\d{1,3}\b|"
+                   r"s\d{1,2}(?!\d)(?![\s._-]*e\d{1,2}))")
+#                                                                  ↑ 整季包常只写 `S01`（不带 E），
+# 少了这一支就会因为标题里的 1080p 被当成电影（实测：`Show S01 COMPLETE 1080p` 落进了 Movies）。
+# 负向断言避开 `S01E03`（那是单集，由第一支命中）与 `S2024` 这种四位数。
+QUALITY_RE = re.compile(r"(?i)(\b(19|20)\d{2}\b|1080p|2160p|720p|480p|\b4k\b|blu-?ray|"
+                        r"web-?dl|webrip|hdtv|remux|hdr|dvdrip|bdrip)")
+
+
+MIN_FREE_GB = float(os.environ.get("A2_MIN_FREE_GB", "20"))   # 目标盘最低余量，低于则拒绝加任务
+
+
+def free_gb(path):
+    """目标路径所在卷的可用空间（GB）。路径不存在时向上找已存在的父目录。"""
+    probe = os.path.abspath(path or ".")
+    while probe and not os.path.exists(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    try:
+        st = os.statvfs(probe or "/")
+    except OSError:
+        return None
+    return st.f_bavail * st.f_frsize / (1024.0 ** 3)
+
+
+def ensure_space(path):
+    """空间不足直接中止 —— 磁盘写满会让 aria2 卡在内核调用里假死（见 skill 排错表）。"""
+    g = free_gb(path)
+    if g is None:
+        return None
+    if g < MIN_FREE_GB:
+        sys.exit("目标盘剩余空间不足：%s 只剩 %.1f GB（阈值 %.0f GB）。\n"
+                 "先清理空间，或临时用 A2_MIN_FREE_GB=5 a2 add ... 放宽。" % (path, g, MIN_FREE_GB))
+    return g
+
+
+def volume_ok(path):
+    """目标盘当前可用吗（跨平台）：目录存在可写，或能创建在非系统盘上。见 path_target_ok。"""
+    ok, why = path_target_ok(path)
+    if not ok:
+        LAST_PATH_REASON[0] = why
+    return ok
+
+
+def target_name(a):
+    """从 URL/磁力/种子文件里猜出资源名（用于分类）。猜不到返回 ''。"""
+    a = a.strip()
+    if a.startswith("magnet:"):
+        q = urllib.parse.parse_qs(urllib.parse.urlsplit(a).query)
+        return (q.get("dn") or [""])[0]
+    if a.startswith(("http://", "https://", "ftp://", "sftp://")):
+        return urllib.parse.unquote(os.path.basename(urllib.parse.urlsplit(a).path))
+    if a.endswith(".torrent") and os.path.exists(a):
+        data = open(a, "rb").read()
+        i = data.find(b"4:name")
+        if i != -1:
+            try:
+                j = i + 6
+                k = data.index(b":", j)
+                return data[k + 1:k + 1 + int(data[j:k])].decode("utf-8", "replace")
+            except (ValueError, UnicodeDecodeError):
+                pass
+    return ""
+
+
+def route(name, force, is_bt=False, dest_dir=None):
+    """(目标目录或 ''(=用 conf 的 dir), 说明文字)。
+    force ∈ {None,'movie','tv','private','flat'}；dest_dir = -d 指定的任意目录（优先级最高）。"""
+    default_dir = conf_get("dir", os.path.expanduser(os.environ.get("A2_DOWNLOAD_DIR", "~/Downloads")))
+    if dest_dir:
+        # -d：直接落用户指定的目录，不进暂存区 —— 因此在 .incoming 之外，钩子不会碰它
+        p = os.path.abspath(os.path.expanduser(dest_dir))
+        if not volume_ok(p):
+            sys.exit("指定目录当前不可用：%s\n    ↓ %s\n    %s" % (p, LAST_PATH_REASON[0], HINT_CREATE))
+        try:
+            os.makedirs(p, exist_ok=True)
+        except OSError as exc:
+            sys.exit("指定目录不可用: %s (%s)" % (p, exc))
+        note = "指定目录 → %s（直达，不经暂存/自动入库）" % p
+        if p in (MOVIE_DIR, TV_DIR, PRIVATE_DIR):
+            note += "；⚠️ 这是媒体库根目录，中转文件也会出现在 Jellyfin 里，建议改用 -m/-t/-P"
+        return p, note
+    if force == "flat":
+        return "", "强制落 %s" % default_dir
+    if force == "private":
+        # 私藏库：名字像不像影视都进这里 —— 分类正则对这类资源故意不生效（-P 是唯一判据）
+        if not volume_ok(MEDIA_ROOT):
+            sys.exit("媒体库当前不可用，媒体下载已中止：%s\n    ↓ %s\n    %s"
+                     % (MEDIA_ROOT, LAST_PATH_REASON[0], HINT_CREATE))
+        stage = os.path.join(STAGING, "Private")
+        try:
+            os.makedirs(stage, exist_ok=True)
+        except OSError as exc:
+            sys.exit("暂存目录不可用: %s (%s)" % (stage, exc))
+        return stage, "私藏（暂时落 %s，完成后自动移入 %s）" % (stage, PRIVATE_DIR)
+    if not name:
+        if force in ("movie", "tv"):
+            cat = force
+        elif is_bt:
+            # 磁力/种子没带名称：先落 _unsorted，下载完由钩子按实际文件名入库
+            if not volume_ok(MEDIA_ROOT):
+                sys.exit("媒体库当前不可用，媒体下载已中止：%s\n    ↓ %s\n    %s"
+                         % (MEDIA_ROOT, LAST_PATH_REASON[0], HINT_CREATE))
+            return os.path.join(STAGING, "_unsorted"), \
+                "磁力未带名称 → 暂存 %s/_unsorted，完成后按实际文件名判断电影/剧集再入库" % STAGING
+        else:
+            return "", "无法判断类型，落 %s（要进媒体库请加 -m / -t）" % default_dir
+    else:
+        looks_media = bool(TV_RE.search(name)) or name.lower().endswith(VIDEO_EXT) \
+            or bool(QUALITY_RE.search(name))
+        if force is None and not looks_media:
+            return "", "普通下载 → %s" % default_dir
+        cat = force if force in ("movie", "tv") else ("tv" if TV_RE.search(name) else "movie")
+    if not volume_ok(MEDIA_ROOT):
+        sys.exit("媒体库当前不可用，媒体下载已中止：%s\n    ↓ %s\n    %s"
+                 % (MEDIA_ROOT, LAST_PATH_REASON[0], HINT_CREATE))
+    label = "剧集" if cat == "tv" else "电影"
+    lib = TV_DIR if cat == "tv" else MOVIE_DIR
+    return os.path.join(STAGING, "TV" if cat == "tv" else "Movies"), \
+        "%s（暂时落 %s/%s，完成后自动移入 %s）" % (label, STAGING, "TV" if cat == "tv" else "Movies", lib)
+
+
+
+def rpc(method, params=None):
+    body = json.dumps({"jsonrpc": "2.0", "id": "a2", "method": method,
+                       "params": ["token:%s" % SECRET] + (params or [])}).encode()
+    req = urllib.request.Request(URL, data=body,
+                                 headers={"Content-Type": "application/json"})
+    try:
+        res = json.loads(urllib.request.urlopen(req, timeout=15).read())
+    except urllib.error.HTTPError as exc:         # aria2 用 HTTP 400 返回 RPC 错误体
+        try:
+            msg = json.loads(exc.read()).get("error", {}).get("message", "HTTP %s" % exc.code)
+        except Exception:                         # noqa: BLE001
+            msg = "HTTP %s" % exc.code
+        sys.exit("RPC 错误: %s" % msg)
+    except Exception as exc:                      # noqa: BLE001
+        sys.exit("RPC 不可用(%s): %s\n提示: 确认守护进程在跑（%s）"
+                 % (URL, exc, service_status_hint()))
+    if "error" in res:
+        sys.exit("RPC 错误: %s" % res["error"].get("message"))
+    return res["result"]
+
+
+def human(n):
+    n = float(n or 0)
+    for unit in ("B", "K", "M", "G", "T"):
+        if n < 1024 or unit == "T":
+            return "%.1f%s" % (n, unit)
+        n /= 1024
+
+
+def all_gids():
+    return [t["gid"] for t in rpc("aria2.tellActive")] + \
+           [t["gid"] for t in rpc("aria2.tellWaiting", [0, 1000])] + \
+           [t["gid"] for t in rpc("aria2.tellStopped", [0, 1000])]
+
+
+def resolve(gid):
+    """前缀 → gid 列表。空输入必须直接报错：空前缀会匹配所有任务。"""
+    gid = (gid or "").strip()
+    if gid == "all":
+        return all_gids()
+    if not gid:
+        sys.exit("缺少 gid，先用 `a2 ls` 查")
+    hits = [g for g in all_gids() if g.startswith(gid)]
+    if not hits:
+        sys.exit("找不到任务: %s" % gid)
+    if len(hits) > 1:
+        sys.exit("前缀不唯一: %s -> %s" % (gid, " ".join(hits)))
+    return hits
+
+
+def name_of(t):
+    # BT 任务优先显示种子名（顶层目录/真实标题），避免 RARBG.txt 之类的小文件
+    # 占了 files[0] 导致 ls 看不到真正在下载什么；非 BT 单文件回退到文件名。
+    bt = t.get("bittorrent", {}).get("info", {}).get("name")
+    if bt:
+        return bt
+    files = t.get("files") or [{}]
+    path = files[0].get("path") or ""
+    return os.path.basename(path) or "-"
+
+
+def row(t):
+    return "%-16s %-8s %-20s %-11s %s" % (
+        t["gid"], t["status"],
+        human(t.get("completedLength", 0)) + "/" + human(t.get("totalLength", 0)),
+        human(t.get("downloadSpeed", 0)) + "/s", name_of(t))
+
+
+def cmd_add(args, name_hint=None):
+    opts, force, out, dest_dir = {}, None, None, None
+    while args and args[0].startswith("-"):
+        flag, args = args[0], args[1:]
+        if flag in ("-p", "--pause"):
+            opts["pause"] = "true"
+        elif flag in ("-m", "--movie"):
+            force = "movie"
+        elif flag in ("-t", "--tv"):
+            force = "tv"
+        elif flag in ("-P", "--private"):
+            force = "private"
+        elif flag in ("-d", "--dir") and args:
+            dest_dir, args = args[0], args[1:]
+        elif flag in ("-flat", "--flat"):
+            force = "flat"
+        elif flag in ("-o", "--out") and args:
+            out, args = args[0], args[1:]
+        else:
+            sys.exit("无法识别的选项或缺少参数: %s" % flag)
+    if not args:
+        sys.exit("缺少下载目标")
+
+    def decide(a):
+        is_bt = a.startswith("magnet:") or a.endswith(".torrent")
+        dest, note = route(out or name_hint or target_name(a), force, is_bt, dest_dir)
+        g = ensure_space(dest or conf_get("dir", "."))
+        if g is not None:
+            note = "%s ｜ 目标盘剩余 %.0f GB" % (note, g)
+        return dest, note
+
+    for a in args:
+        dest, note = decide(a)
+        if a.startswith(("http://", "https://", "ftp://", "magnet:", "sftp://")):
+            o = dict(opts)
+            if out:
+                o["out"] = out
+            if dest:
+                o["dir"] = dest
+            print("+ %s  %s\n    %s" % (rpc("aria2.addUri", [[a], o]), a, note))
+        elif a.endswith(".torrent") and os.path.exists(a):
+            o = dict(opts)
+            if dest:
+                o["dir"] = dest
+            with open(a, "rb") as fh:
+                gid = rpc("aria2.addTorrent", [base64.b64encode(fh.read()).decode(), [], o])
+            print("+ %s  %s\n    %s" % (gid, a, note))
+        elif a.endswith(".txt") and os.path.exists(a):
+            for u in (l.strip() for l in open(a) if l.strip() and not l.startswith("#")):
+                d, n = decide(u)
+                o = dict(opts)
+                if d:
+                    o["dir"] = d
+                print("+ %s  %s\n    %s" % (rpc("aria2.addUri", [[u], o]), u, n))
+        else:
+            print("跳过无法识别的内容: %s" % a)
+
+
+def done_entries():
+    """{(任务目录, 顶层条目)} —— aria2 认定"数据已完整"的条目，sweep 的唯一完成判据。
+
+    为什么不能再看 <条目>.aria2 在不在：conf 里 force-save=true 让完成任务的片段文件永久保留，
+    而 aria2 触发钩子的顺序是「下载完成 → 保存片段文件 → 执行钩子」（aria2.log 实测），
+    所以"没有控制文件"永远不成立，什么都搬不动——三个 BT 剧集就这样在 .incoming 躺了一夜。"""
+    fields = ["dir", "files", "completedLength", "totalLength"]
+    out = set()
+    for method, params in (("aria2.tellActive", [fields]),
+                           ("aria2.tellWaiting", [0, 1000, fields]),
+                           ("aria2.tellStopped", [0, 1000, fields])):
+        for t in rpc(method, params):
+            try:
+                total = int(t.get("totalLength") or 0)
+                got = int(t.get("completedLength") or 0)
+            except (TypeError, ValueError):
+                continue
+            if total <= 0 or got < total:
+                continue
+            d = (t.get("dir") or "").rstrip("/")
+            for f in t.get("files") or []:
+                p = f.get("path") or ""
+                if p.startswith(d + "/"):
+                    out.add((d, p[len(d) + 1:].split("/")[0]))
+                elif p == d:
+                    out.add((d, os.path.basename(p)))
+    return out
+
+
+def media_guard(path):
+    """入库前的完整性守卫：条目里最大的视频文件必须能被 ffprobe 解析。
+    按绝对路径兜底找 ffprobe：服务管理器拉起的进程 PATH 很窄（macOS 的 launchd 里没有
+    Homebrew，Linux 的 systemd --user 里通常没有 /usr/local/bin）。返回 None=通过。"""
+    probe = find_ffprobe()
+    if not probe:
+        return None
+    if os.path.isdir(path):
+        files = []
+        for root, _dirs, names in os.walk(path):
+            for nm in names:
+                if nm.lower().endswith(VIDEO_EXT):
+                    fp = os.path.join(root, nm)
+                    try:
+                        files.append((os.path.getsize(fp), fp))
+                    except OSError:
+                        pass
+        if not files:
+            return None
+        target = max(files)[1]
+    elif path.lower().endswith(VIDEO_EXT):
+        target = path
+    else:
+        return None
+    try:
+        r = subprocess.run([probe, "-v", "error", "-show_entries", "format=duration",
+                            "-of", "default=nw=1:nk=1", target],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180)
+    except Exception as exc:                      # noqa: BLE001
+        return "ffprobe 没能跑起来: %s" % exc
+    if r.returncode != 0 or not r.stdout.strip():
+        err = (r.stderr.decode("utf-8", "replace").strip().splitlines() or
+               ["exit=%d" % r.returncode])[-1]
+        return "ffprobe 校验不过（文件可能不完整）: %s" % err
+    return None
+
+
+def sweep(_args=None):
+    """把暂存目录里已完成、但没被钩子搬走的条目搬进媒体库，并清理残留控制文件。
+    _unsorted（磁力没带名称时落的地方）会按实际条目名判断电影/剧集。
+    完成判据取自 aria2 的 RPC（见 done_entries），不看控制文件在不在；搬迁前用 ffprobe 兜一道。"""
+    import time
+    moved = cleaned = 0
+    try:
+        done = done_entries()
+        offline = False
+    except SystemExit as exc:            # RPC 不可用 → 离线模式：只靠 ffprobe 守卫，且明确警告
+        print("警告：RPC 不可用（%s）\n      改用离线模式：只做 ffprobe 校验，无法确认 aria2 是否认为完整。" % exc)
+        done, offline = None, True
+    except Exception as exc:             # noqa: BLE001
+        print("警告：查询任务列表失败（%s），改用离线模式。" % exc)
+        done, offline = None, True
+    for cat, lib in (("Movies", MOVIE_DIR), ("TV", TV_DIR), ("Private", PRIVATE_DIR),
+                     ("_unsorted", None)):
+        src = os.path.join(STAGING, cat)
+        if not os.path.isdir(src):
+            continue
+        for entry in sorted(os.listdir(src)):
+            p = os.path.join(src, entry)
+            if entry.endswith((".aria2", ".aria2__temp")):
+                # 控制文件对应的数据文件已经入库 -> 这就是残留，清掉
+                base = entry[:-len(".aria2__temp")] if entry.endswith(".aria2__temp") \
+                    else entry[:-len(".aria2")]
+                gone = not os.path.exists(os.path.join(src, base))
+                if lib:
+                    gone = gone and not os.path.exists(os.path.join(lib, base))
+                if gone:
+                    try:
+                        os.remove(p)
+                        print("清理残留控制文件: %s" % p)
+                        cleaned += 1
+                    except OSError as exc:
+                        print("清理失败 %s: %s" % (p, exc))
+                continue
+            if entry.endswith(".torrent") or entry.startswith("[METADATA]"):
+                print("跳过 BT 元数据文件: %s" % p)
+                continue
+            target = lib
+            if target is None:
+                hit = TV_RE.search(entry)
+                looks = hit or entry.lower().endswith(VIDEO_EXT) or QUALITY_RE.search(entry)
+                if not looks:
+                    print("跳过（_unsorted 且判断不出电影/剧集）: %s" % p)
+                    continue
+                target = TV_DIR if hit else MOVIE_DIR
+            if done is not None and (src, entry) not in done:
+                print("跳过（aria2 未报告该条目数据完整：仍在下载/暂停，或任务结果已被清除）: %s" % p)
+                continue
+            bad = media_guard(p)
+            if bad:
+                print("跳过（%s）: %s" % (bad, p))
+                continue
+            dst = os.path.join(target, clean_name(entry))
+            if os.path.exists(dst):
+                dst = "%s.%d" % (dst, int(time.time()))
+            os.rename(p, dst)
+            print("已入库: %s -> %s" % (p, dst))
+            for old, new, why in clean_tree(dst):
+                print("  内部改名(%s): %s -> %s" % (why, old, new))
+            moved += 1
+    print("共移动 %d 个条目，清理 %d 个残留控制文件" % (moved, cleaned))
+
+
+# =====================================================================
+# 搜索源（a2 find / a2 grab）
+# ---------------------------------------------------------------------
+# 本脚本不内置任何种子站/索引站：a2 find 调用你在 a2.conf 里配置的「搜索源命令」
+# （tor-source-cmd=，环境变量 A2_TOR_CMD 可临时覆盖），源命令负责请求、解析、翻页，
+# 把结果以 JSON 打到 stdout；a2 负责过滤、排序、缓存、元数据校验与入库。
+#   完整契约、字段别名与示例：references/tor-source.md
+#   scripts/tor-source-demo.py      —— 离线自测源（不联网，用来验证 find/grab 的流程）
+#   scripts/tor-source-template.py  —— 接入自己站点的骨架（填 URL 与解析即可）
+# 源失败绝不当成「0 条结果」：非零退出 / 超时 / 输出不是 JSON 都会明确报错，绝不猜测。
+# =====================================================================
+TOR_CMD = (os.environ.get("A2_TOR_CMD") or rc_get("tor-source-cmd", "")).strip()
+TOR_CMD_TIMEOUT = float(os.environ.get("A2_TOR_TIMEOUT") or rc_get("tor-source-timeout", "") or 60)
+TOR_CACHE_TTL = int(os.environ.get("A2_TOR_CACHE_TTL") or rc_get("tor-source-cache-ttl", "") or 900)
+TOR_VERIFY_TIMEOUT = int(os.environ.get("A2_TOR_VERIFY_TIMEOUT", "90"))
+TOR_CACHE_DIR = os.path.expanduser(os.environ.get("A2_TOR_CACHE_DIR", "~/.aria2/tor-cache"))
+FIND_CACHE = os.path.expanduser(os.environ.get("A2_FIND_CACHE", "~/.aria2/find-cache.json"))
+TOR_DEBUG = os.environ.get("A2_TOR_DEBUG", "") not in ("", "0")
+CACHE_V = 4                                    # 缓存格式版本（换格式时递增，旧缓存自动失效）
+
+TOR_SETUP_HINT = """没有配置搜索源：a2 不内置任何种子站，搜索源由你自己指定。
+  ① 在 ~/.aria2/a2.conf 里写一行（或临时用环境变量 A2_TOR_CMD=... 覆盖）：
+         tor-source-cmd=<你的搜索源命令>
+     命令里可用 {query}（URL 编码后的关键词）与 {page}（页码，从 1 起）；
+     没有写占位符时，关键词会作为最后一个参数追加，同时也会通过环境变量
+     A2_QUERY / A2_PAGE / A2_PAGES 传给你的脚本。
+  ② 源命令要把结果以 JSON 打到 stdout（字段表与示例：references/tor-source.md）。
+  ③ 想先跑通流程而不联网：
+         tor-source-cmd=python3 ~/.aria2/tor-source-demo.py"""
+
+
+def tor_cmd_fingerprint(cmd):
+    """命令指纹：缓存按键用它，避免把可能带 token 的命令原文写进缓存文件。"""
+    return hashlib.sha1(cmd.encode("utf-8")).hexdigest()[:8]
+
+
+# 命令里可能出现凭据：URL、--token/--key/… 这类参数、或长随机串。命中就只露第一个词（A2_TOR_DEBUG=1 才全打）。
+SENSITIVE_RE = re.compile(r"(?i)(://|(^|[\s=])(-{1,2}(api[-_]?key|key|token|secret|password|pass|auth|sig|signature)\b)"
+                          r"|[A-Za-z0-9_\-]{24,})")
+
+
+def tor_cmd_label(cmd):
+    """给用户看的命令标签：命令里带 URL/token 时只露第一个词 + 指纹，别把凭据打到终端。"""
+    first = (cmd.split() or [cmd])[0]
+    if TOR_DEBUG or not SENSITIVE_RE.search(cmd):
+        return cmd
+    return "%s …（指纹 %s；完整命令见 conf 的 tor-source-cmd，A2_TOR_DEBUG=1 可打印）" \
+           % (first, tor_cmd_fingerprint(cmd))
+
+
+def tor_source_call(query, page, pages):
+    """调用一次源命令，返回原始行（dict 列表）。任何失败都如实报错退出，不静默成 0 条。"""
+    cmd = TOR_CMD
+    q = urllib.parse.quote_plus(query)
+    if "{query}" in cmd or "{page}" in cmd:
+        cmd = cmd.replace("{query}", q).replace("{page}", str(page))
+    else:
+        cmd = "%s %s" % (cmd, q)               # 没有占位符：关键词作为最后一个参数追加
+    env = dict(os.environ, A2_QUERY=query, A2_PAGE=str(page), A2_PAGES=str(pages))
+    try:
+        proc = subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                              timeout=TOR_CMD_TIMEOUT, env=env)
+    except subprocess.TimeoutExpired:
+        sys.exit("搜索源超时（%.0fs，可用 A2_TOR_TIMEOUT 放宽）：%s" % (TOR_CMD_TIMEOUT, tor_cmd_label(cmd)))
+    except OSError as exc:                                 # noqa: BLE001
+        sys.exit("搜索源起不来：%s\n  命令：%s" % (exc, tor_cmd_label(cmd)))
+    out, err = (proc.stdout or "").strip(), (proc.stderr or "").strip()
+    if proc.returncode != 0:
+        sys.exit("搜索源失败（exit %d）：%s%s" % (proc.returncode, tor_cmd_label(TOR_CMD),
+                 ("\n  源报错：%s" % err[-500:]) if err else ""))
+    if not out:
+        sys.exit("搜索源没有输出（exit 0，但 stdout 为空）：%s%s" % (tor_cmd_label(TOR_CMD),
+                 ("\n  源 stderr：%s" % err[-500:]) if err else ""))
+    try:
+        data = json.loads(out)
+    except ValueError as exc:
+        sys.exit("搜索源输出不是 JSON（%s）。\n  前 200 字节：%s\n"
+                 "  规则：stdout 只打 JSON，日志/进度请走 stderr。"
+                 % (exc, out[:200].replace("\n", " ")))
+    if isinstance(data, dict):
+        data = data.get("rows") or data.get("results") or data.get("data") or []
+    if not isinstance(data, list):
+        sys.exit("搜索源返回的 JSON 既不是数组也不是 {\"rows\": [...]}（拿到 %s）" % type(data).__name__)
+    if err and TOR_DEBUG:
+        print("  （源 stderr）%s" % err.splitlines()[-1][:200])
+    return [r for r in data if isinstance(r, dict)]
+
+
+def tor_human_size(n):
+    """字节 → '3.5 GB' 这类可读字符串。"""
+    n = float(n or 0)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return ("%.0f %s" % (n, unit)) if unit in ("B", "KB") else ("%.1f %s" % (n, unit))
+        n /= 1024
+
+
+def tor_magnet(ih, name="", trackers=()):
+    """infohash → 磁力。tracker 由源给（可选）；conf 里的 bt-tracker 在下载时也会生效。"""
+    q = urllib.parse.quote_plus
+    mag = "magnet:?xt=urn:btih:" + ih
+    if name:
+        mag += "&dn=" + q(name)
+    for t in (trackers or ()):
+        mag += "&tr=" + q(str(t))
+    return mag
+
+
+def tor_int(val, default=0):
+    try:
+        return int(float(val))
+    except (TypeError, ValueError):
+        return default
+
+
+def tor_cat_of(title, raw_cat):
+    """分类字符串归一：源给了就按源的；源没给就按标题猜（与 a2 add 的路由规则同一套正则）。"""
+    c = (raw_cat or "").strip().lower()
+    if c.startswith("movie"):
+        return "Movies"
+    if c.startswith("tv"):
+        return "TV"
+    if re.search(r"\b(tv|series|season|episode)\b", c):
+        return "TV"
+    if re.search(r"\b(movie|film)\b", c):
+        return "Movies"
+    if c and c not in ("other", "unknown", "none", "null"):
+        return raw_cat.strip()                 # 其它分类原样保留（默认过滤会剔掉，--all 可见）
+    if TV_RE.search(title) or TOR_SEASON_RE.search(title):
+        return "TV"
+    if QUALITY_RE.search(title) or title.lower().endswith(VIDEO_EXT):
+        return "Movies"
+    return "Other"
+
+
+def tor_norm_row(r):
+    """把源返回的一行规范化；认不出来（没有标题，或既无磁力又无 infohash）返回 None。
+    字段别名见 references/tor-source.md —— 源只要给 title 加 magnet / info_hash 之一就能用。"""
+    def g(*keys):
+        for k in keys:
+            v = r.get(k)
+            if v not in (None, "", []):
+                return v
+        return None
+
+    title = re.sub(r"\s+", " ", str(g("title", "name") or "")).strip()
+    mag = str(g("magnet", "magnet_uri", "magnet_link") or "").strip()
+    ih = str(g("info_hash", "infohash", "ih", "hash") or "").strip().lower()
+    if mag and not ih:
+        m = re.search(r"btih:([0-9a-fA-F]{32,40})", mag)
+        ih = m.group(1).lower() if m else ""
+    if not title or not (mag or ih):
+        return None
+    if not mag:
+        trk = g("trackers", "tr") or []
+        if isinstance(trk, str):
+            trk = [x for x in re.split(r"[,\s]+", trk) if x]
+        mag = tor_magnet(ih, title, trk if isinstance(trk, (list, tuple)) else ())
+    size = g("size_bytes", "bytes", "length", "size_b")
+    if size is not None:
+        size = tor_human_size(tor_int(size))
+    else:
+        s = g("size", "size_str")
+        if isinstance(s, (int, float)):
+            size = tor_human_size(s)
+        elif s:
+            size = str(s).strip()
+        elif g("size_gb") is not None:
+            size = tor_human_size(float(g("size_gb")) * 1e9)
+        else:
+            size = "-"
+    return {"title": title, "magnet": mag, "ih": ih, "size": size,
+            "seeds": tor_int(g("seeders", "seeds", "s")),
+            "leech": tor_int(g("leechers", "leech", "l")),
+            "cat": tor_cat_of(title, g("category", "cat")),
+            "page": str(g("url", "detail", "link", "page") or ""),
+            "src": str(g("source", "src", "site", "indexer") or "搜索源")}
+
+
+# 默认过滤：只看标题/分类文本，与用哪个源无关（--all 关掉全部过滤）
+TOR_SEASON_RE = re.compile(r"(?i)(complete|全集|season[\s._-]*\d|seasons[\s._-]*\d|"
+                           r"s\d{1,2}(?!\d)(?![\s._-]*e\d{1,2})|"
+                           r"s\d{2}[\s._-]*[-~][\s._-]*s?\d{2})")
+TOR_EPISODE_RE = re.compile(r"(?i)s\d{2}[\s._-]?e\d{2}")
+TOR_NOISE = ("3d", "sbs", "hindi", "dual audio", "flac", "e-book", "companion", "audiobook")
+TOR_STATS = {"fetched": 0, "dropped": 0}      # 本轮源返回的行数 / 其中字段不全被丢掉的行数
+
+
+def tor_source_search(query, pages):
+    """按页调用源命令并去重；源不分页时（某页没有新内容）自动停下。
+    顺带统计「源给了几行、其中几行不可用」，好让 cmd_find 把字段写错的源报清楚。"""
+    TOR_STATS.update(fetched=0, dropped=0)
+    rows, seen = [], set()
+    for p in range(1, max(1, pages) + 1):
+        raw = tor_source_call(query, p, pages)
+        TOR_STATS["fetched"] += len(raw)
+        fresh = 0
+        for r in raw:
+            row = tor_norm_row(r)
+            if not row:
+                TOR_STATS["dropped"] += 1
+                continue
+            key = row["ih"] or row["title"].lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(row)
+            fresh += 1
+        if pages > 1 and fresh == 0:
+            break                              # 这一页没有新东西：源不支持分页 / 已翻到底
+    return rows
+
+
+def tor_filter(rows, min_seeds=1, res=None, prefer=(), keep_all=False):
+    """默认过滤 + 排序。规则按分类自适应 —— 电影是单片，标题里永远不会有 “Season/S01-S08”，
+    对它们套「整季/全集」会把结果全删光。所以：
+      电影分类  → 直接留（只过噪音词 / --res / --min-seeds）
+      剧集分类  → 必须命中「整季/全集」，且不是单集 SxxExx
+      其它分类  → 默认不要，--all 才看得到
+    """
+    def keep(r):
+        t, cat = r["title"].lower(), r["cat"].lower()
+        if any(k in t or k in cat for k in TOR_NOISE):
+            return False
+        if res and res.lower() not in t:
+            return False
+        if r["seeds"] < min_seeds:
+            return False
+        if keep_all:
+            return True
+        if cat.startswith("movies"):
+            return True
+        if not cat.startswith("tv"):
+            return False
+        return bool(TOR_SEASON_RE.search(r["title"])) and not TOR_EPISODE_RE.search(r["title"])
+
+    grp = [g.lower() for g in prefer]
+
+    def rank(r):
+        t = r["title"].lower()
+        return (0 if any(g in t for g in grp) else 1, -r["seeds"])
+    return sorted([r for r in rows if keep(r)], key=rank)
+
+
+def cmd_find(args):
+    if args and args[0] in ("-h", "--help", "help"):
+        print("""a2 find —— 搜索（源由你在 {conf} 里配置）
+用法: a2 find <关键词> [--pages N] [--min-seeds N] [--res 1080p] [--prefer 组A,组B] [--all] [--refresh] [--json]
+  --pages N       翻几页（默认 1；源不支持分页会自动停）
+  --min-seeds N   只留做种数 ≥ N 的行（默认 1）
+  --res R         只留该分辨率（1080p/2160p/720p…）
+  --prefer A,B    这些压制组排最前
+  --all           放宽到全部分类（默认只留电影 + 整季剧集，噪音词仍剔除）
+  --refresh       忽略 15 分钟缓存，重新抓源
+  --json          打印规范化后的 JSON（调源时先用它确认字段被认出来了）
+
+搜索源命令写在 {conf} 的 tor-source-cmd=（或用环境变量 A2_TOR_CMD 临时覆盖）；
+契约与示例: references/tor-source.md。看配置步骤: a2 find（不带关键词）""".format(conf=RC))
+        return 0
+    pages, min_seeds, res, prefer = 1, 1, None, []
+    keep_all = as_json = refresh = False
+    q = []
+    while args:
+        a, args = args[0], args[1:]
+        if a == "--pages" and args:
+            pages = max(1, int(args.pop(0)))
+        elif a == "--min-seeds" and args:
+            min_seeds = int(args.pop(0))
+        elif a == "--res" and args:
+            res = args.pop(0)
+        elif a == "--prefer" and args:
+            prefer = [x for x in args.pop(0).split(",") if x]
+        elif a == "--all":
+            keep_all = True
+        elif a == "--json":
+            as_json = True
+        elif a == "--refresh":
+            refresh = True
+        else:
+            q.append(a)
+    if not q:
+        sys.exit("用法: a2 find <关键词> [--pages N] [--min-seeds N] [--res 1080p] "
+                 "[--prefer 组A,组B] [--all] [--refresh] [--json]")
+    if not TOR_CMD:
+        sys.exit(TOR_SETUP_HINT)
+    query = " ".join(q)
+    first = (TOR_CMD.split() or [TOR_CMD])[0]
+    src_id = "%s#%s" % (os.path.basename(first), tor_cmd_fingerprint(TOR_CMD))
+    # 缓存只存「源返回的原始行」（v4：按 源指纹+查询+页数 分键）；过滤参数在读取之后才应用，
+    # 所以 --all / --res / --min-seeds 之间不会互相污染。
+    old = {}
+    if os.path.exists(FIND_CACHE):
+        try:
+            old = json.load(open(FIND_CACHE))
+        except Exception:                                  # noqa: BLE001
+            old = {}
+    age = time.time() - (old.get("ts") or 0)
+    same = (old.get("v") == CACHE_V and old.get("src") == src_id
+            and old.get("query") == query and old.get("pages") == pages and old.get("rows"))
+    if same and not refresh and age < TOR_CACHE_TTL:
+        raw, ts = old["rows"], old.get("ts") or time.time()
+        print("（复用 %.0f 分钟前的缓存：%s；强制重抓加 --refresh）" % (age / 60.0, query))
+    else:
+        raw, ts = tor_source_search(query, pages), time.time()
+    if raw:
+        json.dump({"v": CACHE_V, "src": src_id, "cmd_label": tor_cmd_label(TOR_CMD),
+                   "query": query, "pages": pages, "ts": ts, "rows": raw,
+                   "view": tor_filter(raw, min_seeds, res, prefer, keep_all)},
+                  open(FIND_CACHE, "w"), ensure_ascii=False, indent=1)
+    if not raw:
+        if TOR_STATS["fetched"] and TOR_STATS["dropped"]:
+            print("搜索源返回了 %d 行，但没有一行能用：每行至少要有一个标题，以及 magnet 或 info_hash。\n"
+                  "  请检查源输出的字段名（契约与别名见 references/tor-source.md）。" % TOR_STATS["fetched"])
+        else:
+            print("搜索源返回 0 条结果：%s ｜ 关键词 %r。\n"
+                  "  换关键词再试；如果源本身该有结果，先在终端单独跑一遍源命令（A2_TOR_DEBUG=1 会打印它）。"
+                  % (tor_cmd_label(TOR_CMD), query))
+        return 0
+    rows = tor_filter(raw, min_seeds, res, prefer, keep_all)
+    if as_json:
+        print(json.dumps(rows, ensure_ascii=False, indent=1))
+        return 0
+    if not rows:
+        print("源给了 %d 条，但没有一条通过默认过滤。\n"
+              "  --all 放宽到全部分类（含单集；噪音词仍会剔除）、--min-seeds 0 放宽做种数、--res 去掉分辨率限制，"
+              "或用别组关键词重搜。" % len(raw))
+        print("缓存已写 %s（`a2 find <关键词> --all --json` 可直接看原始结果）" % FIND_CACHE)
+        return 0
+    print("%-3s %-5s %-5s %8s  %-15s %s" % ("#", "种", "吸", "体积", "分类", "标题"))
+    for i, r in enumerate(rows, 1):
+        print("%-3d %-5d %-5d %8s  %-15s %s" % (i, r["seeds"], r["leech"], r["size"],
+                                                r["cat"][:15], r["title"][:96]))
+    print("\n共 %d 条（源 %s，原始 %d 条%s）。入库: a2 grab <序号>   （多个用逗号: a2 grab 1,3,5）"
+          % (len(rows), src_id, len(raw), "，%d 页" % pages if pages > 1 else ""))
+    print("没看到想要的？--pages N 多翻几页（源若不分页会自动停）；--all 放宽到全部分类；"
+          "搜不到就调整搜索源本身（见 references/tor-source.md）。")
+    return 0
+
+
+def tor_magnet_of(row):
+    """行里的磁力（源给的或规范化时按 infohash 拼好的）。"""
+    mag = (row.get("magnet") or "").strip()
+    if mag:
+        return mag
+    ih = (row.get("ih") or "").strip()
+    if re.fullmatch(r"[0-9a-fA-F]{32}|[0-9a-fA-F]{40}", ih):
+        return tor_magnet(ih.lower(), row.get("title") or "")
+    sys.exit("这一行既没有磁力也没有 infohash，无法入库：%s\n"
+             "  数据来自你自己的搜索源，请检查它输出的字段（契约见 references/tor-source.md）。"
+             % row.get("title"))
+
+
+def tor_bdecode(data):
+    """够了用的 bencode 解析（只为了读 .torrent 里的 info 段）。"""
+    def parse(i):
+        c = data[i:i + 1]
+        if c == b"i":
+            j = data.index(b"e", i)
+            return int(data[i + 1:j]), j + 1
+        if c == b"l":
+            i, out = i + 1, []
+            while data[i:i + 1] != b"e":
+                v, i = parse(i)
+                out.append(v)
+            return out, i + 1
+        if c == b"d":
+            i, out = i + 1, {}
+            while data[i:i + 1] != b"e":
+                k, i = parse(i)
+                v, i = parse(i)
+                out[k] = v
+            return out, i + 1
+        j = data.index(b":", i)
+        n = int(data[i:j])
+        return data[j + 1:j + 1 + n], j + 1 + n
+    return parse(0)[0]
+
+
+def tor_verify(magnet, timeout=None):
+    """bt-metadata-only：从 DHT 拉真实元数据，确认「真有人在做种」且磁力没被改过。
+    两个坑写在这里，别改回去：
+      1) 这种模式下 RPC 的 bittorrent.info.name 是 None、totalLength 只有几十 KB（那是 [METADATA] 本身），
+         真实文件列表只能解析落盘的 <infohash>.torrent；
+      2) 校验任务照样占一个下载槽（conf 默认 max-concurrent-downloads=3），dir 必须是非 .incoming 目录。
+    返回 {name, bytes, files, has_extras} 或 None（拿不到/超时）。"""
+    timeout = timeout or TOR_VERIFY_TIMEOUT
+    if not os.path.isdir(TOR_CACHE_DIR):
+        os.makedirs(TOR_CACHE_DIR)
+    m = re.search(r"btih:([0-9a-fA-F]{40})", magnet)
+    ih = m.group(1) if m else ""
+    gid = rpc("aria2.addUri", [[magnet], {"bt-metadata-only": "true", "bt-save-metadata": "true",
+                                          "seed-time": "0", "dir": TOR_CACHE_DIR}])
+    deadline, status, offline, t = time.time() + timeout, "active", False, {}
+    while time.time() < deadline:
+        try:
+            t = rpc("aria2.tellStatus", [gid, ["status", "errorCode", "errorMessage"]])
+        except SystemExit:                                 # 任务没了（被清/进程重启过）
+            offline = True
+            break
+        status = t["status"]
+        if status not in ("active", "waiting"):
+            break
+        time.sleep(3)
+    info = None
+    tp = os.path.join(TOR_CACHE_DIR, (ih or "").lower() + ".torrent")
+    if status == "complete" and os.path.exists(tp):
+        try:
+            d = tor_bdecode(open(tp, "rb").read())
+            i = d.get(b"info") or {}
+            files = i.get(b"files")
+            total = i.get(b"length") or sum(f.get(b"length", 0) for f in (files or []))
+            name = (i.get(b"name") or b"").decode("utf-8", "replace")
+            info = {"name": name, "bytes": total,
+                    "files": len(files) if files else 1,
+                    "has_extras": any(b"featurette" in p.lower() or b"extra" in p.lower()
+                                      for f in (files or []) for p in f.get(b"path", []))}
+        except Exception as exc:                           # noqa: BLE001
+            print("  元数据解析失败: %s" % exc)
+    try:
+        if status in ("active", "waiting"):
+            rpc("aria2.forceRemove", [gid])
+        rpc("aria2.removeDownloadResult", [gid])
+    except SystemExit:
+        pass
+    if os.path.exists(tp):
+        os.remove(tp)                                      # 校验产物不留
+    rpc("aria2.saveSession")
+    if info:
+        return info
+    if offline:
+        print("  校验中断：任务已不在 aria2 里")
+    elif status in ("active", "waiting"):
+        print("  校验超时 %ds：DHT 上没有节点给出元数据（源标的做种数不一定可信）。" % timeout)
+    elif status == "error":
+        print("  校验失败：aria2 errorCode=%s" % (t.get("errorCode") if isinstance(t, dict) else "?"))
+    else:
+        print("  校验无结论：任务状态 %s，但 %s 没拿到元数据" % (status, os.path.basename(tp)))
+    return None
+
+
+def cmd_grab(args):
+    if args and args[0] in ("-h", "--help", "help"):
+        print("""a2 grab —— 按搜索结果入库（默认先校验真做种）
+用法: a2 grab <序号|标题片段|infohash|磁力> [-t|-m|-P|-flat|-d 目录] [-p] [-o 文件名] [--no-verify]
+  序号      最近一次 `a2 find` 视图里的序号，支持多个/区间: a2 grab 1,3,5 / a2 grab 2-4
+  标题片段  命中标题或详情页 URL 子串（含空格时加引号）
+  infohash  32/40 位；缓存里有现成磁力就用现成的，没有就自己拼
+  磁力      完整 magnet: 链接，不走缓存
+  -t/-m/-P  强制分类（剧集/电影/私藏）    -flat 落默认下载目录    -d DIR 直达指定目录
+  -p        加入后暂停    -o 文件名 指定保存名
+  --no-verify  跳过 bt-metadata-only 真做种校验（源标的做种数可能撒谎）
+
+序号取的是最近一次 find 的视图（过滤+排序后），并在 ~/.aria2/find-cache.json 里缓存 15 分钟。""")
+        return 0
+    verify, force, out, pause, dir_out, targets = True, None, None, False, None, []
+    while args:
+        a, args = args[0], args[1:]
+        if a == "--no-verify":
+            verify = False
+        elif a in ("-t", "--tv"):
+            force = "tv"
+        elif a in ("-m", "--movie"):
+            force = "movie"
+        elif a in ("-P", "--private"):
+            force = "private"
+        elif a in ("-d", "--dir") and args:
+            dir_out = args.pop(0)
+        elif a in ("-flat", "--flat"):
+            force = "flat"
+        elif a in ("-p", "--pause"):
+            pause = True
+        elif a in ("-o", "--out") and args:
+            out = args.pop(0)
+        else:
+            targets.append(a)
+    if not targets:
+        sys.exit("用法: a2 grab <序号|标题片段|infohash|磁力> [-t|-m|-P|-flat|-d 目录] "
+                 "[-p] [-o 名字] [--no-verify]")
+
+    # 序号支持 “1,3,5” 和 “2-4”
+    picks = []
+    for t in targets:
+        if re.fullmatch(r"\d+(,\d+)*", t):
+            picks += [int(x) for x in t.split(",")]
+        elif re.fullmatch(r"\d+-\d+", t):
+            a, b = (int(x) for x in t.split("-"))
+            picks += list(range(a, b + 1))
+        else:
+            picks.append(t)
+    cache = json.load(open(FIND_CACHE)) if os.path.exists(FIND_CACHE) else {}
+    # 序号按 view 取（= a2 find 屏幕上的那份，过滤+排序后）；老缓存没有 view 才退回原始行
+    listed = cache.get("view") or cache.get("rows") or []
+    rows = cache.get("rows") or []
+
+    for pick in picks:
+        row, magnet = None, None
+        if isinstance(pick, int):
+            if not listed:
+                sys.exit("没有缓存结果，先跑 `a2 find <关键词>`")
+            if not 1 <= pick <= len(listed):
+                sys.exit("序号 %d 超出范围 1..%d" % (pick, len(listed)))
+            row = listed[pick - 1]
+        elif pick.startswith("magnet:"):
+            magnet = pick
+        elif re.fullmatch(r"[0-9a-fA-F]{32}|[0-9a-fA-F]{40}", pick):
+            # 只给 infohash：先在缓存里找现成的磁力（源可能带了 tracker），找不到就自己拼
+            hit = [r for r in rows if (r.get("ih") or "").lower() == pick.lower()]
+            magnet = (hit[0].get("magnet") if hit else None) or tor_magnet(pick.lower())
+        else:
+            low = pick.lower()
+            hit = [r for r in listed if low in (r.get("page") or "").lower()
+                   or low in r["title"].lower()]
+            if not hit:
+                sys.exit("缓存里找不到 %r（先 a2 find，或给序号/标题片段/完整磁力）" % pick)
+            row = hit[0]
+        if row:
+            print("== %s\n   %s ｜ %s ｜ %s ｜ 源标注 seeds %d"
+                  % (row["title"], row["size"], row["cat"], row.get("src") or "搜索源", row["seeds"]))
+            magnet = tor_magnet_of(row)
+        print("   磁力: %s" % magnet)
+        # 分类用条目标题（校验拿到的真实名称优先）：磁力里的 dn= 常被源简写，
+        # 只看 dn 会把整季包当成普通下载（落 conf 的 dir，不入媒体库）。
+        hint = (row or {}).get("title")
+        if force is None and row:
+            # 用户没显式指定 -m/-t 时，跟随搜索结果那一行的分类（源的分类，或由标题推断的分类）
+            force = {"tv": "tv", "movie": "movie"}.get((row.get("cat") or "").strip().lower())
+        if verify:
+            print("   校验中（bt-metadata-only，最多 %ds）…" % TOR_VERIFY_TIMEOUT)
+            info = tor_verify(magnet)
+            if not info:
+                print("   × 未入库：拿不到元数据。多半是真没人做种（或磁力已失效），"
+                      "可用 --no-verify 强行入库、或换一条。")
+                continue
+            print("   ✓ 元数据到手: %s" % info["name"])
+            print("     %d 个文件 / %.2f GB%s" % (info["files"], info["bytes"] / 1e9,
+                                                 "（含花絮 Featurettes）" if info["has_extras"] else ""))
+            hint = info["name"]
+        flags = []
+        if force:
+            flags.append({"tv": "-t", "movie": "-m", "private": "-P", "flat": "-flat"}[force])
+        if dir_out:
+            flags += ["-d", dir_out]
+        if pause:
+            flags.append("-p")
+        if out:
+            flags += ["-o", out]
+        cmd_add(flags + [magnet], name_hint=hint)
+    return 0
+
+
+def main(argv):
+    if len(argv) < 2:
+        print(__doc__)
+        return 0
+    cmd, args = argv[1], argv[2:]
+    if cmd in ("-h", "--help", "help"):
+        print(__doc__)
+        return 0
+    if cmd not in ("add", "sweep", "find", "grab", "ls", "list", "st", "info", "files", "pause",
+                   "unpause", "resume", "rm", "purge", "up", "down"):
+        # 允许省略 add：`a2 -m <magnet>`、`a2 <url>`、`a2 -p <链接>` 都当成 add
+        args, cmd = argv[1:], "add"
+
+    if cmd == "add":
+        cmd_add(args)
+    elif cmd == "sweep":
+        sweep()
+    elif cmd == "find":
+        return cmd_find(args)
+    elif cmd == "grab":
+        return cmd_grab(args)
+    elif cmd in ("ls", "list"):
+        show_all = bool(args and args[0] == "-a")
+        stopped = rpc("aria2.tellStopped", [0, 1000])
+        groups = [("活动", rpc("aria2.tellActive")),
+                  ("等待", rpc("aria2.tellWaiting", [0, 1000]))]
+        if show_all:
+            groups.append(("已结束", stopped))
+        for title, tasks in groups:
+            if tasks:
+                print("== %s ==" % title)
+                for t in tasks:
+                    print(row(t))
+        if stopped and not show_all:
+            print("(另有 %d 个已结束任务，`a2 ls -a` 查看，`a2 purge` 清空)" % len(stopped))
+    elif cmd == "st":
+        g = rpc("aria2.getGlobalStat")
+        print("下载 %s/s  上传 %s/s  活动 %s  等待 %s  已结束 %s" % (
+            human(g["downloadSpeed"]), human(g["uploadSpeed"]), g["numActive"],
+            g["numWaiting"], g["numStopped"]))
+    elif cmd == "info":
+        t = rpc("aria2.tellStatus", [resolve(args[0])[0],
+                 ["gid", "status", "totalLength", "completedLength", "downloadSpeed",
+                  "uploadSpeed", "connections", "numSeeders", "errorCode", "errorMessage",
+                  "dir", "files"]])
+        for k in ("gid", "status", "totalLength", "completedLength", "downloadSpeed",
+                  "uploadSpeed", "connections", "numSeeders", "errorCode", "errorMessage", "dir"):
+            print("%-16s %s" % (k, t.get(k)))
+        for f in t.get("files", []):
+            print("  [%s] %s %s" % (f.get("index"), human(f.get("length")), f.get("path")))
+    elif cmd == "files":
+        for f in rpc("aria2.getFiles", [resolve(args[0])[0]]):
+            print("[%s] %s %s" % (f.get("index"), human(f.get("length")), f.get("path")))
+    elif cmd in ("pause", "unpause", "resume"):
+        force = "force" in args
+        if force:
+            args = [a for a in args if a != "force"]
+        if not args:
+            sys.exit("缺少 gid 或 all")
+        pausing = cmd == "pause"
+        if args[0] == "all":
+            meth = ("forcePauseAll" if force else "pauseAll") if pausing else "unpauseAll"
+            print(rpc("aria2." + meth) or "OK")
+        else:
+            meth = ("forcePause" if force else "pause") if pausing else "unpause"
+            for gid in resolve(args[0]):
+                print(gid, rpc("aria2." + meth, [gid]))
+    elif cmd == "rm":
+        if not args:
+            sys.exit("缺少 gid 或 all")
+        waiting = [t["gid"] for t in rpc("aria2.tellWaiting", [0, 1000])]
+        stopped = [t["gid"] for t in rpc("aria2.tellStopped", [0, 1000])]
+        for gid in (all_gids() if args[0] == "all" else resolve(args[0])):
+            try:
+                if gid in stopped:
+                    rpc("aria2.removeDownloadResult", [gid])   # 已结束：清结果
+                else:
+                    rpc("aria2.forceRemove", [gid])            # 活动/等待：直接摘掉
+            except SystemExit as exc:
+                print("跳过 %s (%s)" % (gid, exc))
+                continue
+            print("已移除 %s" % gid)
+        rpc("aria2.saveSession")
+    elif cmd == "purge":
+        print(rpc("aria2.purgeDownloadResult") or "已清空")
+    elif cmd in ("up", "down"):
+        if not args:
+            sys.exit("缺少速率，如 1M / 0")
+        key = "max-overall-upload-limit" if cmd == "up" else "max-overall-download-limit"
+        val = "0" if args[0] in ("0", "off") else args[0]
+        rpc("aria2.changeGlobalOption", [{key: val}])
+        print("%s = %s（本次运行有效；想持久化就改 conf 再重启服务：%s）"
+              % (key, val, service_restart_hint()))
+    else:
+        print(__doc__)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

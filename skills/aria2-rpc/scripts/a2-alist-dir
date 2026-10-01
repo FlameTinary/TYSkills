@@ -1,0 +1,113 @@
+#!/bin/bash
+# 批量下载 AList 中的整个目录
+# 用法: a2-alist-dir "AList目录路径" [输出目录] [文件过滤]
+# 示例: a2-alist-dir "/aliyun/电影" ${A2_MEDIA_ROOT:-$HOME/media}/Movies
+#       a2-alist-dir "/aliyun/剧集" ${A2_MEDIA_ROOT:-$HOME/media}/TV "*.mkv"
+
+ALIST_URL="http://localhost:5244"
+USERNAME="admin"
+PASSWORD_FILE="$HOME/.alist/admin_password.txt"
+DEFAULT_OUTPUT="${A2_DOWNLOAD_DIR:-$HOME/Downloads}"
+
+if [ -z "$1" ]; then
+    echo "用法: a2-alist-dir \"AList目录路径\" [输出目录] [文件过滤]"
+    echo ""
+    echo "示例:"
+    echo "  a2-alist-dir \"/aliyun/长安的荔枝\""
+    echo "  a2-alist-dir \"/aliyun/电影\" ${A2_MEDIA_ROOT:-$HOME/media}/Movies"
+    echo "  a2-alist-dir \"/aliyun/剧集\" ${A2_MEDIA_ROOT:-$HOME/media}/TV \"*.mkv\""
+    exit 1
+fi
+
+DIR_PATH="$1"
+OUTPUT_DIR="${2:-$DEFAULT_OUTPUT}"
+FILTER="${3:-*}"
+
+# 读取密码
+if [ -f "$PASSWORD_FILE" ]; then
+    PASSWORD=$(grep -o 'password: [^ ]*' "$PASSWORD_FILE" | tail -1 | awk '{print $2}')
+else
+    read -s -p "AList 管理员密码: " PASSWORD
+    echo ""
+fi
+
+# 登录
+TOKEN=$(curl -s -X POST "$ALIST_URL/api/auth/login" \
+  -H "Content-Type: application/json" \
+  -d "{\"username\":\"$USERNAME\",\"password\":\"$PASSWORD\"}" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['token'])" 2>/dev/null)
+
+if [ -z "$TOKEN" ]; then
+    echo "错误: 登录失败"
+    exit 1
+fi
+
+# 列出目录
+echo "正在读取目录: $DIR_PATH"
+FILE_LIST=$(curl -s -X POST "$ALIST_URL/api/fs/list" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: $TOKEN" \
+  -d "{\"path\":\"$DIR_PATH\",\"password\":\"\",\"page\":1,\"per_page\":500,\"refresh\":false}")
+
+CODE=$(echo "$FILE_LIST" | python3 -c "import sys,json; print(json.load(sys.stdin).get('code', 0))")
+
+if [ "$CODE" != "200" ]; then
+    echo "错误: 读取目录失败"
+    echo "$FILE_LIST" | python3 -m json.tool
+    exit 1
+fi
+
+# 提取文件列表（过滤掉目录，只保留文件）
+FILES=$(echo "$FILE_LIST" | python3 -c "
+import sys,json,fnmatch
+d = json.load(sys.stdin)
+content = d['data']['content']
+filter_pattern = sys.argv[1] if len(sys.argv) > 1 else '*'
+files = [f for f in content if not f['is_dir'] and fnmatch.fnmatch(f['name'], filter_pattern)]
+for f in files:
+    print(f['name'])
+" "$FILTER")
+
+if [ -z "$FILES" ]; then
+    echo "目录中没有匹配的文件"
+    exit 0
+fi
+
+FILE_COUNT=$(echo "$FILES" | wc -l | tr -d ' ')
+echo "找到 $FILE_COUNT 个文件，开始添加下载任务..."
+echo ""
+
+# 确保输出目录存在
+mkdir -p "$OUTPUT_DIR"
+
+# 逐个添加下载
+SUCCESS=0
+FAILED=0
+while IFS= read -r FILENAME; do
+    [ -z "$FILENAME" ] && continue
+    
+    FILE_PATH="$DIR_PATH/$FILENAME"
+    
+    # 获取直链
+    RAW_URL=$(curl -s -X POST "$ALIST_URL/api/fs/get" \
+      -H "Content-Type: application/json" \
+      -H "Authorization: $TOKEN" \
+      -d "{\"path\":\"$FILE_PATH\",\"password\":\"\"}" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['data']['raw_url'] if d.get('code')==200 else '')" 2>/dev/null)
+    
+    if [ -n "$RAW_URL" ]; then
+        a2 add -d "$OUTPUT_DIR" "$RAW_URL" > /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            echo "  ✓ $FILENAME"
+            SUCCESS=$((SUCCESS + 1))
+        else
+            echo "  ✗ $FILENAME (添加失败)"
+            FAILED=$((FAILED + 1))
+        fi
+    else
+        echo "  ✗ $FILENAME (获取直链失败)"
+        FAILED=$((FAILED + 1))
+    fi
+done <<< "$FILES"
+
+echo ""
+echo "完成: 成功 $SUCCESS 个, 失败 $FAILED 个"
+echo "用 'a2 list' 查看下载进度"

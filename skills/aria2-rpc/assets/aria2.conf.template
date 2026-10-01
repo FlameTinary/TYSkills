@@ -1,0 +1,114 @@
+## ===================== 基础全局设置 =====================
+# 下载保存目录（普通文件/非媒体的默认落点；目录不可用时启动器拒绝启动，见 start-aria2.sh）
+# 注意：aria2 不展开 ~ ！写 `dir=~/Downloads` 会创建一个字面量 `~/` 目录（实测），
+# 所以这里用 __HOME__，由 install-a2.sh 替换成绝对路径；手工安装请自己写绝对路径。
+dir=__HOME__/Downloads
+# 磁盘预分配：none 不预分配 / prealloc 预分配 / falloc 最快（需要文件系统支持稀疏文件）
+# 不支持稀疏文件的外接盘（macOS 的 HFS+ 是典型；APFS / ext4 / XFS / NTFS 正常）必须用 none：
+# falloc 会真的把 100GB 的种子写满零，内核回写时 aria2 的周期性 fsync 被堵住，RPC 假死（实测）。
+file-allocation=none
+# 断点续传
+continue=true
+# 已存在同名文件时自动重命名（xxx.1.ext），不覆盖
+auto-file-renaming=true
+allow-overwrite=false
+# 服务端支持时用 Last-Modified 做条件下载、保留远端时间戳
+conditional-get=true
+remote-time=true
+# Content-Disposition 里的中文文件名按 UTF-8 解码
+content-disposition-default-utf8=true
+# 统一 UA，部分站点会拒绝默认 aria2 UA
+user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36
+
+## ===================== HTTP/FTP/SFTP 设置 =====================
+# 单服务器最大连接数
+max-connection-per-server=16
+# 最小分片大小，不要太小，避免大量IO
+min-split-size=10M
+# 单个任务最大分片数量
+split=16
+# 整体最大同时下载任务数
+max-concurrent-downloads=3
+# 重试次数
+max-tries=5
+retry-wait=10
+# 超时
+connect-timeout=10
+timeout=60
+# 404 之类的容忍次数
+max-file-not-found=3
+## ===================== RPC 设置 =====================
+enable-rpc=true
+# RPC监听端口（a2 会自动从本配置读取）
+rpc-listen-port=6801
+# 仅本机访问，更安全；局域网远程改为 true
+rpc-listen-all=false
+# RPC密钥：安装脚本会自动生成随机串替换 __RPC_SECRET__；如需暴露局域网请换长随机串
+rpc-secret=__RPC_SECRET__
+# 允许跨域(AriaNg网页UI需要)
+rpc-allow-origin-all=true
+rpc-save-upload-metadata=true
+rpc-max-request-size=16M
+
+## ===================== 任务会话持久化（重启后任务列表不丢） =====================
+# 这两个文件必须在启动前已存在，否则 aria2 报 "打开文件失败" 直接退出（安装脚本会建空文件）
+save-session=__HOME__/.aria2/aria2.session
+input-file=__HOME__/.aria2/aria2.session
+save-session-interval=30
+force-save=true
+
+## ===================== BT / 磁力设置 =====================
+enable-dht=true
+enable-dht6=false
+enable-peer-exchange=true
+bt-enable-lpd=false
+# BT监听端口范围（正确选项名是 listen-port；1.37 没有 bt-listen-port，写了只会产生 WARN）
+listen-port=6881-6899
+# DHT 端口范围（与上面可重叠，aria2 自行复用）
+dht-listen-port=6881-6899
+# 单个BT任务最大节点数
+bt-max-peers=120
+# 上传/下载总限速，0=不限速。上传封顶 2M：做种/leech 上传时不占满上行（下调到 1M 或调整后缀即可）
+max-overall-upload-limit=2M
+# 下载不限速
+max-overall-download-limit=0
+# 下载完成后做种时长(分钟)，0=下载完停止做种
+seed-time=0
+# 分享比率，seed-time=0 时该值不生效
+seed-ratio=0
+# tracker 列表（建议定期从 ngosang/trackerslist 更新 best trackers）
+bt-tracker=udp://tracker.opentrackr.org:1337/announce,udp://open.stealth.si:80/announce,udp://tracker.torrent.eu.org:451/announce,udp://tracker.dler.org:6969/announce,https://tracker.openbittorrent.com/announce,udp://open.demonii.com:1337/announce,udp://tracker.qu.ax:6969/announce,udp://exodus.desync.com:6969/announce,udp://tracker.tryhackx.org:6969/announce,udp://tracker.nyaa.vc:6969/announce,udp://tracker.corpscorp.online:80/announce,udp://explodie.org:6969/announce,udp://tracker.bittor.pw:1337/announce,udp://tracker-udp.gbitt.info:80/announce,udp://tracker.ducks.party:1984/announce,udp://retracker01-msk-virt.corbina.net:80/announce,http://tracker.dler.com:6969/announce,udp://tracker2.dler.org:80/announce,http://tracker.renfei.net:8080/announce,udp://tracker.peerfect.org:6969/announce,udp://tracker.opentrackr.com:6969/announce
+# 自动保存种子元信息(磁力转torrent)
+bt-save-metadata=true
+# 无进度则超时退出：0=关闭。别设小了！公共 BT 冷门资源停滞 5 分钟很正常，
+# 之前设 300 把 100GB 的剧集包在 13MB 处停掉（errorCode=7 未完成），看起来就是"任务全失败"。
+bt-stop-timeout=0
+
+## ===================== 高级优化 =====================
+# 磁盘缓存，减少硬盘IO
+disk-cache=64M
+# 控制文件保存间隔(秒)，取值 0-600。每次保存都会 fsync 数据文件，外接慢盘上别太频繁
+auto-save-interval=300
+# mmap 降低大文件内存占用（不支持稀疏文件的慢盘上关掉：mmap 脏页回写会让 fsync 长时间阻塞）
+enable-mmap=false
+# 日志，调试时打开，平时设 warn
+# 注意：warn 会把 "BT 下载超时被停止" 这类 INFO 过滤掉，任务莫名失败时无从查证；
+# 需要排查时临时改回 info 并 kickstart -k 重启，查完记得改回来。
+log-level=warn
+console-log-level=warn
+# 日志文件路径
+log=__HOME__/.aria2/aria2.log
+# 进度输出间隔(秒)，0=关闭；作为守护进程时看日志即可
+summary-interval=60
+
+## ===================== a2 自己的配置在 ~/.aria2/a2.conf =====================
+# 搜索源（a2 find 用）、服务名这些 **a2 专有** 的配置不要写进本文件：aria2 不认识的键
+# 每次启动都会打 `[WARN] Unknown option: …`（无害但刷屏）。请写 ~/.aria2/a2.conf，
+# 模板见本技能 assets/a2.conf.template（install-a2.sh 会自动装好）。
+# 搜索源的契约与示例：references/tor-source.md
+
+## ===================== 事件钩子 =====================
+# 下载完成：媒体任务（落在 .incoming 暂存区）自动搬进 Jellyfin 媒体库；普通下载不受影响
+on-download-complete=__HOME__/.aria2/on-complete.py
+# 下载失败钩子同理
+# on-download-error=__HOME__/.aria2/on_error.sh

@@ -1,0 +1,31 @@
+# =============================================================
+# a2 自己的配置（a2 专有；aria2 不读这个文件，所以不会有 Unknown option 警告）
+# 位置：~/.aria2/a2.conf   模板：本技能 assets/a2.conf.template（服务定义模板另见 assets/ 下的 plist 与 service）
+# 改完立刻生效，不需要重启守护进程（每次跑 a2 都会重新读）
+# 环境变量优先级更高，可用于临时覆盖：A2_TOR_CMD / A2_SERVICE / A2_TOR_TIMEOUT / A2_TOR_CACHE_TTL …
+# =============================================================
+
+# 服务名（macOS launchd / Linux systemd unit / Windows 计划任务）：只影响 a2 报错时给的提示命令
+# （install-a2.sh 用 A2_SERVICE 决定真实服务名；换过名字这里也改成同一个）
+service=__LABEL__
+
+# -------------------------------------------------------------
+# 种子搜索源 —— a2 不内置任何种子站，a2 find 就调用下面这条命令
+# -------------------------------------------------------------
+# 源命令负责请求/解析/翻页，把结果以 JSON 打到 stdout（日志走 stderr，失败就非零退出）。
+# 可用占位符：{query} = URL 编码后的关键词，{page} = 页码（从 1 起）；
+# 不写占位符时，关键词会作为最后一个参数追加；同时也会通过环境变量传：
+#     A2_QUERY=原始关键词   A2_PAGE=页码   A2_PAGES=本次要几页
+#
+# 离线自测（不联网，先跑通 a2 find / a2 grab 的流程）：
+#   tor-source-cmd=python3 __HOME__/.aria2/tor-source-demo.py
+# 接入自己的站点：照 __HOME__/.aria2/tor-source-template.py 填 URL 与解析，然后写在这里，例如：
+#   tor-source-cmd=python3 __HOME__/my-sites/xyz-search.py --q {query} --p {page}
+# 完整字段表、别名与排查：references/tor-source.md
+tor-source-cmd=
+
+# 单次调用源命令的超时（秒）—— 源卡死时 a2 会在这个时间后报错而不是一直等
+tor-source-timeout=60
+
+# 同一关键词+页码的缓存有效期（秒）；期内 a2 find 直接复用上次结果，--refresh 强制重抓
+tor-source-cache-ttl=900

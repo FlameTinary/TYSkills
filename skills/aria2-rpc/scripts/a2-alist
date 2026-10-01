@@ -1,0 +1,85 @@
+#!/bin/bash
+# 通过 AList 获取直链并用 a2(aria2) 下载
+# 用法: a2-alist "AList文件路径" [输出目录]
+
+ALIST_URL="http://localhost:5244"
+USERNAME="admin"
+DEFAULT_OUTPUT="${A2_DOWNLOAD_DIR:-$HOME/Downloads}"
+PASSWORD_FILE="$HOME/.alist/admin_password.txt"
+
+if [ -z "$1" ]; then
+    echo "用法: a2-alist \"AList中的文件路径\" [输出目录]"
+    echo ""
+    echo "示例:"
+    echo "  a2-alist \"/aliyun/长安的荔枝/05 4K.mp4\""
+    echo "  a2-alist \"/aliyun/电影.mkv\" ${A2_MEDIA_ROOT:-$HOME/media}/Movies"
+    exit 1
+fi
+
+FILE_PATH="$1"
+OUTPUT_DIR="${2:-$DEFAULT_OUTPUT}"
+
+# 读取密码
+if [ -f "$PASSWORD_FILE" ]; then
+    PASSWORD=$(grep -o 'password: [^ ]*' "$PASSWORD_FILE" | tail -1 | awk '{print $2}')
+else
+    read -s -p "请输入 AList 管理员密码: " PASSWORD
+    echo ""
+fi
+
+# 登录
+LOGIN_RESULT=$(curl -s -X POST "$ALIST_URL/api/auth/login" \
+  -H "Content-Type: application/json" \
+  -d "{\"username\":\"$USERNAME\",\"password\":\"$PASSWORD\"}")
+
+TOKEN=$(echo "$LOGIN_RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['token'])" 2>/dev/null)
+
+if [ -z "$TOKEN" ]; then
+    echo "错误: 登录 AList 失败"
+    echo "$LOGIN_RESULT"
+    exit 1
+fi
+
+# 获取文件信息和直链
+RESULT=$(curl -s -X POST "$ALIST_URL/api/fs/get" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: $TOKEN" \
+  -d "{\"path\":\"$FILE_PATH\",\"password\":\"\"}")
+
+CODE=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('code', 0))")
+
+if [ "$CODE" != "200" ]; then
+    echo "错误: 获取文件信息失败"
+    echo "$RESULT" | python3 -m json.tool
+    exit 1
+fi
+
+RAW_URL=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['raw_url'])")
+FILE_NAME=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['name'])")
+FILE_SIZE=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['size'])")
+
+# 可读大小
+SIZE_STR=$(python3 -c "
+size = $FILE_SIZE
+if size > 1073741824:
+    print(f'{size/1073741824:.2f}GB')
+elif size > 1048576:
+    print(f'{size/1048576:.2f}MB')
+else:
+    print(f'{size/1024:.1f}KB')
+")
+
+echo "文件名: $FILE_NAME"
+echo "大小: $SIZE_STR"
+echo "输出: $OUTPUT_DIR"
+echo ""
+
+# 确保输出目录存在
+mkdir -p "$OUTPUT_DIR"
+
+# 添加到 a2
+echo "正在添加下载任务..."
+a2 add -d "$OUTPUT_DIR" "$RAW_URL"
+
+echo ""
+echo "任务已添加！用 'a2 list' 查看进度"

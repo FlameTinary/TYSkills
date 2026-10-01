@@ -1,0 +1,16 @@
+[Unit]
+Description=aria2 RPC 下载守护（a2）
+After=network-online.target
+# 媒体库在外接盘上时，取消下面一行的注释并改成你的媒体库根，让 systemd 等挂载完成再启动：
+# RequiresMountsFor=__HOME__/media
+
+[Service]
+Type=simple
+# 关键：前台运行 —— 不要加 --daemon=true，fork 后进程退出会被 Restart=always 当成崩溃反复拉起
+ExecStart=__HOME__/.aria2/start-aria2.sh --daemon=false --summary-interval=0
+Restart=always
+RestartSec=10
+WorkingDirectory=__HOME__
+
+[Install]
+WantedBy=default.target
