@@ -13,9 +13,7 @@
 
 # ---------- 路径 ----------
 # 主目录（媒体库 / 数据目录 / 缓存目录，按技能自己的语义命名）
-# 可以放在任何盘：外部磁盘、网络盘、Windows 盘符都行
-# macOS/Linux 例： /Volumes/<你的盘>/media   /mnt/<你的盘>/media   ~/media
-# Windows   例： D:\media
+# 可以放在任何盘：外接盘、网络盘都可以，例如 /Volumes/<你的盘>/media、/mnt/<你的盘>/media、~/media
 # 留空则用技能内置默认（通常是家目录下的位置）
 MAIN_DIR=
 

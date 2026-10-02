@@ -8,6 +8,9 @@
 处置四档：**删除**（内容本身不该存在）、**参数化**（改成配置项）、**占位**（改成通用示例）、
 **保留并说明**（公共知识，但要在文档里讲清是默认值）。
 
+本库只收录**泄漏**相关的形态。跨平台适配（POSIX 专有 API、单边 shell 选项等）不是脱敏的职责，
+不在这里处理。
+
 ---
 
 ## 1. 秘密（一律删除 + 轮换）
@@ -57,16 +60,7 @@
 
 **唯一要求**：文档里说清「这是默认值，改过请改配置」——不要让读者以为必须照抄。
 
-## 5. 可移植性缺陷（不是泄漏，但属于「别人用不了」）
-
-见 `references/cross-platform.md`。审计器会标 `posix-only-api`、`hardcoded-tmp`、`bsd-sed-inplace`、
-`gnu-only-flag`、`os-specific-opener`、`bare-python-cmd`、`hardcoded-shebang`。
-
-真实例子：`import fcntl` 在模块顶层 → Windows 原生 Python 直接 `ImportError`，钩子永远跑不起来。
-改法：`try: import fcntl / except ImportError: import msvcrt`，锁语义分别实现
-（`flock(LOCK_EX|LOCK_NB)` vs `msvcrt.locking(LK_NBLCK)`），两者都没有时退化为不加锁 + 超时。
-
-## 6. 仓库与元数据层面的泄漏（文件之外）
+## 5. 仓库与元数据层面的泄漏（文件之外）
 
 | 面 | 内容 | 处置 |
 |---|---|---|

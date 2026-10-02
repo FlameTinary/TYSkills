@@ -1,42 +1,26 @@
 # TYSkills
 
 个人自用 skill 集合。每个 skill 都是一个自包含的 `SKILL.md` 包（附带 `scripts/`、`references/`、`assets/`），
-**安装方式就是把技能目录复制（或软链）到 agent 的本地技能目录**，不需要发布到任何商店、不需要安装器：
-Hermes Agent、Claude Code、Codex、OpenCode、OpenClaw 都按同一个约定扫描本地目录里的 `SKILL.md`。
+谁支持 `SKILL.md` 这个约定，把技能目录放进它的本地技能目录就能用。
 
 ## 技能列表
 
 | 技能 | 一句话说明 | 适用平台 |
 |---|---|---|
 | [aria2-rpc](skills/aria2-rpc/) | aria2 下载中枢：`a2` 高级封装 CLI，媒体下载自动分级入库、种子搜索入库、限速/暂停/继续、AList 网盘直链下载、一键部署为守护服务 | macOS / Linux / Windows(WSL、Git Bash) |
-| [skill-sanitize-and-publish](skills/skill-sanitize-and-publish/) | 技能脱敏与发布：审计本机痕迹（路径/用户名/密钥/代理/私有域名）、按类处置、私有值落用户配置文件、三平台可移植、写 README 与五 agent 安装说明 | macOS / Linux / Windows |
+| [skill-sanitize](skills/skill-sanitize/) | 技能脱敏：审计技能里的本机痕迹（路径/用户名/主机名/密钥/代理/私有域名）、按类处置（删除/参数化/占位/留痕保留）、需要私有化的值改成用户自己的配置文件 | macOS / Linux / Windows |
 
-## 安装到各个 agent（本地目录，复制或软链）
+## 怎么用
+
+克隆后把 `skills/<技能名>/` 复制（或软链）到你所用 agent 的技能目录即可，例如
+`~/.agents/skills/`、`~/.claude/skills/`、`~/.hermes/skills/<类别>/`：
 
 ```bash
 git clone https://github.com/FlameTinary/TYSkills.git
-SKILL=aria2-rpc        # 换成要装的那个技能名（另一项：skill-sanitize-and-publish）
-
-# 通用目录：Codex / OpenCode / OpenClaw 都会读它
-mkdir -p ~/.agents/skills
-cp -R "TYSkills/skills/$SKILL" ~/.agents/skills/
-
-# Claude Code / OpenCode
-mkdir -p ~/.claude/skills
-ln -s "$PWD/TYSkills/skills/$SKILL" ~/.claude/skills/"$SKILL"
-
-# Hermes Agent（类别目录按需换：software-development / media / …）
-mkdir -p ~/.hermes/skills/software-development
-ln -s "$PWD/TYSkills/skills/$SKILL" ~/.hermes/skills/software-development/"$SKILL"
-
-# OpenClaw / OpenCode 的全局目录（可选；~/.agents/skills 已覆盖，放这里也行）
-mkdir -p ~/.config/opencode/skills ~/.openclaw/skills
+cp -R TYSkills/skills/<技能名> ~/.agents/skills/     # 用 ln -s 则 git pull 后即最新版
 ```
 
-也可以每个目录都用符号链接，`git pull` 之后即是最新版。
-Windows 把 `~` 换成 `%USERPROFILE%`（PowerShell：`$env:USERPROFILE`），
-软链需要开发者模式，不满足就用 `Copy-Item -Recurse` 复制。
-各家读取的完整目录清单见 [skills/skill-sanitize-and-publish/references/agent-install.md](skills/skill-sanitize-and-publish/references/agent-install.md)。
+Windows 把 `~` 换成 `%USERPROFILE%`。技能就是一个目录 + `SKILL.md`，不依赖安装器或账号。
 
 ## 目录结构
 
@@ -47,11 +31,11 @@ skills/
 │   ├── assets/               # 配置与服务定义模板（占位符由安装脚本替换）
 │   ├── references/           # 分主题参考文档（命令详解、搜索源契约、排错、AList API 等）
 │   └── scripts/              # 可执行程序：a2、裸 RPC 客户端、完成钩子、安装/启动脚本
-└── skill-sanitize-and-publish/
-    ├── SKILL.md              # 脱敏与发布流程、红线、验收清单
-    ├── assets/               # 私有配置模板 + 三平台配置加载器
-    ├── references/           # 泄漏分类库、五 agent 安装路径、可移植性规则、报告模板
-    └── scripts/audit_skill.py# 审计器：泄漏 + 可移植性 + frontmatter，退出码可作 CI 门禁
+└── skill-sanitize/
+    ├── SKILL.md              # 脱敏流程、红线、分类处置表、验收清单
+    ├── assets/               # 私有配置模板 + 配置加载器
+    ├── references/           # 泄漏分类库、脱敏报告模板
+    └── scripts/audit_skill.py# 审计器：本机痕迹 + 文件完整性，退出码可用作门禁
 ```
 
 ---
@@ -226,35 +210,30 @@ a2 报 RPC 不可用                    → 确认守护在跑（launchctl / sys
 
 ---
 
-# skill-sanitize-and-publish
+# skill-sanitize
 
 ## 简介
 
-把「只能在本机跑」的技能，变成「任何人拿到就能用」的技能包。四件事：
+把一个技能里**属于某台机器、属于作者本人**的内容清干净，让它「换一台机器、换一个人，照样能用」。
+四件事：
 
-1. **审计**：`scripts/audit_skill.py` 扫全目录，按 high/medium/low 分级报出本机痕迹与不可移植写法 ——
-   家目录路径、用户名、主机名、外接盘卷标、局域网 IP、私有域名、个人服务名、令牌/密码/私钥/邮箱、
-   写死的代理端口、GNU/BSD 单边选项、`fcntl` 这类 POSIX 专有 API、frontmatter 格式问题
-   （技能名与目录名不一致、小于 57 字符窗口里没有触发词、BOM/CRLF）。
+1. **审计**：`scripts/audit_skill.py` 扫全目录，按 high/medium/low 分级报出本机痕迹 ——
+   家目录路径、用户名、主机名、外接盘卷标、局域网 IP、私有域名、个人服务名、真实邮箱，
+   以及令牌/密码/私钥/refresh_token/Cookie/含密码的 URL、写死的代理端口，
+   并顺带检查脱敏改写有没有把文件改坏（frontmatter 起止、BOM/CRLF）。
+   默认还会拿**本机**的用户名与主机名当判据。
 2. **按类处置**：每条命中给出四种处置之一 —— 删除（秘密）、参数化（本机特有的值）、占位（示例值）、
    保留并写理由（公共知识，如 AList 默认端口 5244）。处置记录留在报告里。
-3. **私有值落配置文件**：要私有化的东西（路径、端口、密钥、搜索源命令、代理）迁到
+3. **私有值落配置文件**：要私有化的东西（路径、端口、密钥、站点命令、代理）迁到
    `~/.<技能名>/<技能名>.conf`，只提交 `*.conf.template`；配 `assets/conf_loader.py` 读取，
    优先级 命令行参数 > 环境变量 > 配置文件 > 内置默认；没有配置文件时给出「缺什么、去哪配」的报错。
-4. **可移植与发布**：脚本按 macOS / Linux / Windows 三平台收口，写 README 与五大 agent 的
-   **本地安装目录**（复制或软链即可用，不走任何商店），再从远端核实发布结果。
+4. **留痕**：文档里必须保留的反面示例用 `audit-skip: 理由` 就地记账；报告归档在本地。
 
-不适用：只在本机自用的技能（不必付出脱敏成本）；从零写新技能（这不是写技能的模板）。
+技能边界：**只做脱敏**。跨平台适配、给其他 agent 打包安装、发布到仓库都不归它管。
 
 ## 依赖
 
-- `python3`（3.8+，仅标准库；三平台通用）
-- 可选：`gh`（发布到 GitHub 时用）、`git`
-
-## 安装
-
-与其它技能相同：把 `skills/skill-sanitize-and-publish/` 复制/软链到 agent 的本地技能目录。
-它是纯 Python + Markdown，无第三方依赖，`audit_skill.py` 也可以脱离 agent 单独当命令行工具用。
+- `python3`（3.8+，仅标准库），也可以脱离 agent 单独当命令行工具用
 
 ## 使用方法
 
@@ -262,27 +241,22 @@ a2 报 RPC 不可用                    → 确认守护在跑（launchctl / sys
 # 审计一个技能目录（退出码 0 = 没有达到 --fail-level 的问题）
 python3 scripts/audit_skill.py /path/to/skill
 
-# 更严：medium 也算失败；输出 JSON 便于聚合；顺手写一份处置报告
+# 更严 + 输出 JSON 便于聚合 + 顺手写一份处置报告
 python3 scripts/audit_skill.py /path/to/skill --fail-level medium --json --report 脱敏报告.md
 
 # 补上只有你知道的专属词（用户名、主机名、域名、站点名、盘标），一行一词
 python3 scripts/audit_skill.py /path/to/skill --terms ~/.config/skill-sanitize/local-terms.txt
 ```
 
-- 默认还会拿**本机**的用户名与主机名当判据（`--no-host-facts` 关闭）。
-- 文档里必须保留的反面示例，用 `audit-skip: 理由`（行级）或 `audit-skip-file: 理由`（文件级，前 8 行内）
-  就地记账；理由会进报告，不算静默跳过。
 - 报告内含命中原文，**只留本地或私有仓库**。
 - `assets/private.conf.template` 是给被脱敏技能用的配置模板；
-  `assets/conf_loader.py` 是可直接抄走的三平台配置加载器。
+  `assets/conf_loader.py` 是可直接抄走的配置加载器。
 
 ## 参考文档
 
 | 文件 | 内容 |
 |---|---|
 | `references/leak-taxonomy.md` | 泄漏分类库：每类长什么样、为什么算泄漏、怎么改（含 before/after） |
-| `references/agent-install.md` | Hermes / Claude Code / Codex / OpenCode / OpenClaw 的本地技能目录与 frontmatter 差异 |
-| `references/cross-platform.md` | 三平台可移植性规则（shell、Python、路径、服务管理、文件锁、编码） |
 | `references/report-template.md` | 脱敏报告模板（交付给用户看的处置清单） |
 
 ## 免责声明

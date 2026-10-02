@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# audit-skip-file: 本文件是泄漏规则与示例词表的定义处，正则字面量（/tmp、品牌名、个人叙述词、
-#                   示例路径）即规则本身，不是泄漏内容。改规则时不要顺手放宽这里的豁免。
-"""audit_skill.py —— 技能「脱敏 / 可移植性」审计器（跨平台，仅标准库，Python 3.8+）。
+# audit-skip-file: 本文件是泄漏规则与示例词表的定义处，正则字面量（品牌名、个人叙述词、
+#                   示例路径、示例域名）即规则本身，不是泄漏内容。改规则时不要放宽这里的豁免。
+"""audit_skill.py —— 技能脱敏审计器（仅标准库，Python 3.8+）。
 
-做三件事，任何一件失败都以非零码退出：
+只做两件事，任何一件有问题都以非零码退出：
   1) 泄漏扫描：本机路径、用户名、主机名、卷标、局域网 IP、代理、密钥、令牌、
      真实邮箱、个人服务名/私有域名、机器状态叙述……按 high/medium/low/info 分级。
-  2) 可移植性扫描：只在某一个 OS 上成立的 shell/Python 写法、硬编码 /tmp、fcntl 等。
-  3) 格式扫描：SKILL.md 的 frontmatter 是否被五大 agent（Hermes / Claude Code /
-     Codex / OpenCode / OpenClaw）接受（名字规则、目录名匹配、description 长度、BOM/CRLF）。
+  2) 文件完整性：脱敏时大改内容后，SKILL.md 是否还完整（frontmatter 起止、name/
+     description 是否还在、BOM/CRLF、编码）。
+
+不负责跨平台适配，也不负责把技能打包给某个 agent 使用 —— 那不在脱敏的职责内。
 
 用法：
     python3 audit_skill.py <技能目录> [更多目录...] [选项]
@@ -19,7 +20,7 @@
     --fail-level LVL    达到该级别即退出码 1（high|medium|low|info，默认 high）
     --terms FILE        追加「本机专属词表」（一行一词，# 注释）—— 你自己的
                         用户名/主机名/域名/站点名/盘符名，通用规则抓不到的用这个兜底
-    --no-host-facts     不把当前机器的用户名/主机名家目录当判据
+    --no-host-facts     不把当前机器的用户名/主机名当判据
     --report FILE.md    额外写一份 Markdown 报告
     --max-bytes N       单文件扫描上限（默认 2 MiB）
     -q/--quiet          只打印结论
@@ -189,35 +190,6 @@ RULES = [
     ("info", "path", "unknown-domain-url",
      r"https?://([A-Za-z0-9.\-]+)",
      "非白名单域名：确认不是你的私有站点/内网服务。", "value", "_domain_ok"),
-
-    # ---------- 可移植性 ----------
-    ("medium", "portability", "posix-only-api",
-     r"(?m)^\s*(?:import|from)\s+(fcntl|pty|termios|pwd|grp|crypt|resource)\b|"
-     r"\b(?:os\.fork|os\.killpg|os\.setsid|os\.getuid|signal\.SIGKILL)\b",
-     "POSIX 专有 API：Windows 上直接崩。改用 psutil/subprocess/条件分支。", "line", None),
-    ("medium", "portability", "hardcoded-tmp",
-     r"(?<![\w/])(?:/tmp|/var/tmp|C:\\\\Windows\\\\Temp)(?![\w])",
-     "硬编码临时目录：改用 tempfile.gettempdir() / $TMPDIR。", "line", None),
-    ("medium", "portability", "bsd-sed-inplace",
-     r"\bsed\s+-i\s+(?!''|\"\"|\.\w+)[^\s]",
-     "`sed -i` 在 macOS(BSD) 上必须带备份后缀：`sed -i ''`；GNU 则不接受空后缀。", "line", None),
-    ("medium", "portability", "gnu-only-flag",
-     r"\b(?:grep\s+-P|sed\s+-r\b|sort\s+-V|xargs\s+-r\b|readlink\s+-f|realpath\s|"
-     r"date\s+-d\b|stat\s+-c\b|stat\s+-f\b|cp\s+--parents|mktemp\s+-p\b)",
-     "GNU/BSD 单边选项：换 Python 实现或在文中按平台给出两种写法。", "line", None),
-    ("low", "portability", "os-specific-opener",
-     r"(?<![\w.\-])(?:osascript|launchctl|pmset|defaults\s+write|systemctl|schtasks|"
-     r"winreg|xdg-open|start\s+[\"']http)(?![\w.\-])",
-     "平台专有命令：若技能声称跨平台，需按平台分支或明确标注。", "line", None),
-    ("low", "portability", "bare-python-cmd",
-     r"(?<![\w.\-/])python\s+-[cm]\b|(?<![\w.\-/])pip\s+install|(?<![\w.\-/])py\s+-3\b",
-     "`python`/`pip` 在部分系统不存在（只有 python3/py -3）。统一用 python3 或探测。", "line", None),
-    ("low", "portability", "hardcoded-shebang",
-     r"^#!\s*/(?:usr/)?bin/(?:env\s+)?(?:bash|python3?|sh|zsh)\b",
-     "`#!/usr/bin/env bash` 比绝对路径可移植。", "line", None),
-    ("info", "portability", "package-manager-line",
-     r"\b(?:brew|apt-get|apt|dnf|yum|pacman|winget|scoop|choco)\s+(?:install|add)\b",
-     "包管理器命令：确认三平台都给了对应写法。", "line", None),
 ]
 
 RULE_TITLES = {}
@@ -472,10 +444,7 @@ def scan_file(path, rules, root, max_hits_per_rule=200):
             hits += 1
             if hits > max_hits_per_rule:
                 break
-            lvl = rule["level"]
-            if rule["id"] == "posix-only-api" and ("msvcrt" in text or "ImportError" in text):
-                lvl = "info"      # 文件里有 Windows 兜底分支，不算可移植性缺陷
-            out.append(Finding(lvl, rule["category"], rule["id"], path, i,
+            out.append(Finding(rule["level"], rule["category"], rule["id"], path, i,
                                snippet, rule["hint"]))
     return out
 
@@ -499,13 +468,13 @@ def check_frontmatter(root):
             # 集合型仓库（根下若干个技能）：根目录本来就不该有 SKILL.md
             return [Finding("info", "format", "collection-root", root, 0,
                             "根目录是技能集合，发现 %d 个技能" % len(nested),
-                            "对集合审计只需逐个子技能满足格式要求；根目录放 README 即可。")]
+                            "集合目录本身不是技能；逐个子目录审计即可。")]
         return [Finding("high", "format", "missing-skill-md", root, 0, "目录下没有 SKILL.md",
-                        "必须存在 SKILL.md（全大写），否则没有 agent 会加载它。")]
+                        "确认路径是否给对；是技能目录的话，SKILL.md 是它的主文件。")]
     if os.path.basename(skill_md) != "SKILL.md":
-        out.append(Finding("high", "format", "skill-md-casing", skill_md, 0,
+        out.append(Finding("medium", "format", "skill-md-casing", skill_md, 0,
                            "文件名不是全大写 SKILL.md",
-                           "OpenCode 等要求全大写：重命名为 SKILL.md。"))
+                           "技能主文件按约定是全大写；脱敏时不顺手改名会挡住后续维护。"))
     got = read_text(skill_md)
     if got is None:
         return out
@@ -526,42 +495,26 @@ def check_frontmatter(root):
     desc = re.search(r"(?m)^description\s*:\s*(.+?)\s*$", fm)
     if not name:
         out.append(Finding("high", "format", "frontmatter-name", skill_md, 1,
-                           "frontmatter 缺 `name`", "name 为必需字段。"))
-    else:
-        val = name.group(1).strip().strip("\"'")
-        if not re.match(r"^[a-z0-9]+(-[a-z0-9]+)*$", val):
-            out.append(Finding("high", "format", "name-charset", skill_md, 1, "name=%s" % val,
-                               "必须是 ^[a-z0-9]+(-[a-z0-9]+)*$（小写、单连字符、无首尾连字符）。"))
-        if len(val) > 64:
-            out.append(Finding("high", "format", "name-length", skill_md, 1, "name 超过 64 字符",
-                               "OpenCode/AgentSkills 上限 64。"))
-        if val != os.path.basename(root.rstrip("/")):
-            out.append(Finding("high", "format", "name-dir-mismatch", skill_md, 1,
-                               "name=%s ≠ 目录名 %s" % (val, os.path.basename(root.rstrip("/"))),
-                               "OpenCode 要求 name 与所在目录名一致。"))
+                           "frontmatter 缺 `name`",
+                           "脱敏改写把 name 弄丢了 —— 补回来（值取目录名最稳）。"))
     if not desc:
         out.append(Finding("high", "format", "frontmatter-description", skill_md, 1,
                            "frontmatter 缺 `description`",
-                           "description 决定技能何时被加载，必需。"))
+                           "脱敏改写把 description 弄丢了 —— 补回来。"))
     else:
         val = desc.group(1).strip().strip("\"'")
         if len(val) > 1024:
             out.append(Finding("high", "format", "description-length", skill_md, 1,
-                               "description %d 字符" % len(val), "上限 1024 字符。"))
-        elif len(val) > 60:
-            out.append(Finding("info", "format", "description-long", skill_md, 1,
-                               "description %d 字符（>60）" % len(val),
-                               "Hermes 索引窗口约 57 字符：把触发词放在最前面。"))
+                               "description %d 字符（异常长）" % len(val),
+                               "确认改写没有把整段正文塞进 description。"))
     if not body.strip():
         out.append(Finding("high", "format", "empty-body", skill_md, 1, "frontmatter 之后没有正文",
-                           "加正文（When to Use / Procedure / Verification…）。"))
-    if "{{" in body and "}}" in body and "{" not in body.replace("{{", ""):
-        pass
+                           "改写后正文丢了 —— 检查文件是否被截断。"))
     return out
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="技能脱敏/可移植性审计（跨平台）")
+    ap = argparse.ArgumentParser(description="技能脱敏审计：本机痕迹 + 文件完整性")
     ap.add_argument("paths", nargs="+", help="要审计的技能目录（可多个）")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--fail-level", default="high",
