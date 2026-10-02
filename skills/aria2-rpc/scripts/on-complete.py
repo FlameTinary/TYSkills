@@ -22,7 +22,18 @@ aria2 调用时会传 3 个参数：gid、文件数、第一个文件路径（�
 入库时会调用 nameclean.clean_name() 清洗站点广告（去网址/"地址发布页"之类），
 只削广告片段，不动 SxxExx/年份/分辨率这些刮削要用的信息；目录内部也洗（最多两层）。
 """
-import fcntl, json, os, re, shutil, subprocess, sys, time, urllib.error, urllib.request
+import json, os, re, shutil, subprocess, sys, time, urllib.error, urllib.request
+
+try:                                                     # POSIX：flock 加锁
+    import fcntl
+except ImportError:                                      # Windows 原生 Python 没有 fcntl
+    fcntl = None
+    try:
+        import msvcrt                                    # Windows：字节区间锁
+    except ImportError:
+        msvcrt = None
+else:
+    msvcrt = None
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 try:
@@ -133,6 +144,15 @@ LOCK = os.path.expanduser("~/.aria2/move.lock")
 FIELDS = ["gid", "status", "dir", "completedLength", "totalLength", "files"]
 
 
+def try_lock(fh):
+    """非阻塞取排他锁；两个平台都没有锁原语时退化为「不加锁」（单机单进程下由上层超时兜底）。"""
+    if fcntl is not None:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    elif msvcrt is not None:
+        fh.seek(0)
+        msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+
+
 def acquire_lock(timeout=180):
     """跨进程互斥：多个任务几乎同时完成时 aria2 会并发调用本钩子，两个实例同时扫同一目录会互相踩
     （日志里表现为一条"入库"紧跟一条 rename 的 No such file）。"""
@@ -144,7 +164,7 @@ def acquire_lock(timeout=180):
     deadline = time.time() + timeout
     while True:
         try:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try_lock(fh)
             return fh
         except OSError:
             if time.time() >= deadline:
