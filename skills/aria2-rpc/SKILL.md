@@ -167,7 +167,7 @@ a2 add --dir "$(a2-dest check "$(a2-dest media)/TV")" "<磁力>"   # 落点检�
   分辨率 `--res`、做种阈值 `--min-seeds`（seeds 未知的行不参与，HTML 页常见）、压制组优先 `--prefer` 都可叠加。
 - **搜索结果可不可信看 `a2-verify`**：bt-metadata-only 从 DHT 拉真实元数据，拉不到（退出码 1）就别下。
 - **站点抓不到 ≠ 没资源**：HTML 模式只认页面里的 `magnet:` 链接；结果页是 JS 渲染时，改用 `cmd:` 源
-  （自己请求 API/解析），或换站点。`A2_SEARCH_PROXY=http://127.0.0.1:7897` 可给抓取指定代理。
+  （自己请求 API/解析），或换站点。需要代理就在 `search-sites.conf` 写 `proxy=`（或 `A2_SEARCH_PROXY`）。
 - **不要手写搜索**：先看 `a2-search sites` 与 `search-sites.conf`，再考虑全网发现；同一关键词别反复翻 10 页。
 
 ### 5.3 整季包只下缺的集（select-file，裸 RPC）

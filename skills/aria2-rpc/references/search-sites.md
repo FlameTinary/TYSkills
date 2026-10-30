@@ -24,6 +24,7 @@
 site=某站|https://example.org/search?q={query}&page={page}
 site=本地演示|cmd:python3 ~/.aria2/search-source-demo.py
 websearch=https://www.bing.com/search?q={query}
+proxy=http://127.0.0.1:7897          # 可选：抓取走代理（环境变量 A2_SEARCH_PROXY 优先）
 ```
 
 `install-a2.sh` 会把模板装到 `~/.aria2/search-sites.conf`，并把两个示例源脚本放进 `~/.aria2/`：
@@ -43,8 +44,8 @@ websearch=https://www.bing.com/search?q={query}
 - 做种数只在同一行内出现 `SE 12` / `seeds: 12` / `种子 12` 这类写法时才有，否则留空
   （留空**不参与** `--min-seeds` 过滤）；
 - 一行一个磁力、多条重复时按 infohash 去重；
-- 抓取用 `urllib`，默认跟你系统的 `http_proxy/https_proxy`；要指定代理：
-  `A2_SEARCH_PROXY=http://127.0.0.1:7897`。超时 `A2_SEARCH_TIMEOUT`（默认 20 秒）。
+- 抓取用 `urllib`，默认跟你系统的 `http_proxy/https_proxy`；要指定代理：配置里写 `proxy=…`
+  （或环境变量 `A2_SEARCH_PROXY`，优先级更高）。超时 `A2_SEARCH_TIMEOUT`（默认 20 秒）。
 
 **JS 渲染、Cloudflare 挑战、需要登录的站点，HTML 模式拿不到东西**——这类改用 `cmd:` 源
 （自己请求 API 或带 Cookie 抓页面），或换站点。抓不到时脚本会明确说「0 条磁力」，不会伪装成「没有这个资源」。

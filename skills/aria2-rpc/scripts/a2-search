@@ -37,6 +37,7 @@ import urllib.parse
 import urllib.request
 
 CONF = os.path.expanduser(os.environ.get("A2_SITES_CONF", "~/.aria2/search-sites.conf"))
+CONF_PROXY = [os.environ.get("A2_SEARCH_PROXY") or ""]   # search-sites.conf 里的 proxy= 会填进来
 TIMEOUT = float(os.environ.get("A2_SEARCH_TIMEOUT", "20"))
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
@@ -54,6 +55,9 @@ CONF_TEMPLATE = """# a2-search 的站点配置（A2_SITES_CONF 可换路径）
 #
 # 全网发现（可选）：一个通用搜索页，用来找"还有哪些页面有资源"
 # websearch=https://www.bing.com/search?q={query}
+#
+# 抓取代理（可选）：需要走代理时写一行（等价于环境变量 A2_SEARCH_PROXY）
+# proxy=http://127.0.0.1:7897
 
 websearch=https://www.bing.com/search?q={query}
 """
@@ -87,18 +91,18 @@ STATS = {"fetched": 0, "dropped": 0, "pages": 0}
 # ---------------------------------------------------------------- 配置
 
 def load_conf(create=True):
-    """返回 ({name: target}, websearch)。文件不存在时按模板生成一份（不内置任何资源站）。"""
+    """返回 ({name: target}, websearch, proxy)。文件不存在时按模板生成一份（不内置任何资源站）。"""
     created = False
     if not os.path.exists(CONF):
         if not create:
-            return {}, ""
+            return {}, "", ""
         d = os.path.dirname(CONF)
         if d:
             os.makedirs(d, exist_ok=True)
         with open(CONF, "w") as fh:
             fh.write(CONF_TEMPLATE)
         created = True
-    sites, websearch = {}, ""
+    sites, websearch, proxy = {}, "", ""
     with open(CONF) as fh:
         for line in fh:
             line = line.strip()
@@ -112,9 +116,11 @@ def load_conf(create=True):
                     sites[name.strip()] = target.strip()
             elif key == "websearch":
                 websearch = val
+            elif key == "proxy":
+                proxy = val
     if created:
         sys.stderr.write("已生成站点配置 %s（填 site= 行之后就有站点可搜；参考 references/search-sites.md）\n" % CONF)
-    return sites, websearch
+    return sites, websearch, proxy
 
 
 def cmd_label(cmd):
@@ -144,7 +150,7 @@ def fill(template, query, page):
 def fetch(url, timeout=None):
     req = urllib.request.Request(url, headers={"User-Agent": UA,
                                                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"})
-    proxy = os.environ.get("A2_SEARCH_PROXY")
+    proxy = os.environ.get("A2_SEARCH_PROXY") or CONF_PROXY[0]
     if proxy:
         handler = urllib.request.ProxyHandler({"http": proxy, "https": proxy})
         opener = urllib.request.build_opener(handler)
@@ -459,7 +465,9 @@ def main(argv):
         print(USAGE.strip())
         return 0 if args else 2
 
-    sites, websearch = load_conf()
+    sites, websearch, proxy = load_conf()
+    if proxy and not CONF_PROXY[0]:
+        CONF_PROXY[0] = proxy
 
     if args[0] == "sites":
         if not sites:
@@ -470,6 +478,8 @@ def main(argv):
             print("%-12s %-4s %s" % (name, kind, shown))
         if websearch:
             print("%-12s %-4s %s" % ("(websearch)", "发现", websearch))
+        if proxy or CONF_PROXY[0]:
+            print("%-12s %-4s %s" % ("(proxy)", "抓取", proxy or CONF_PROXY[0]))
         return 0
 
     mode_discover = False

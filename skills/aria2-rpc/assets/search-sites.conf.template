@@ -19,3 +19,6 @@
 #
 # 全网发现：一个通用搜索页，用来找「还有哪些页面/站点有资源」
 websearch=https://www.bing.com/search?q={query}
+
+# 抓取代理（可选；等价于环境变量 A2_SEARCH_PROXY，环境变量优先）
+# proxy=http://127.0.0.1:7897

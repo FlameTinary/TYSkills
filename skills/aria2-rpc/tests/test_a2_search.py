@@ -93,6 +93,14 @@ class SearchTests(unittest.TestCase):
             self.run_cli("电影")
         self.assertIn("还没有配置站点", str(ctx.exception))
 
+    def test_proxy_line_is_read(self):
+        self.write_conf("site=夹具|file://%s" % self.page, "proxy=http://127.0.0.1:7897")
+        _sites, _web, proxy = self.mod.load_conf()
+        self.assertEqual(proxy, "http://127.0.0.1:7897")
+        rc, out, _ = self.run_cli("sites")
+        self.assertEqual(rc, 0)
+        self.assertIn("127.0.0.1:7897", out)
+
     def test_sites_listing(self):
         self.write_conf("site=夹具|file://%s" % self.page, "websearch=https://example.org/?q={query}")
         rc, out, _ = self.run_cli("sites")

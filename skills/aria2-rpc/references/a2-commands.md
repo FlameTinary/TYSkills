@@ -144,7 +144,7 @@ AList 本身的安装/阿里云盘接入见本技能 `references/install-guide.m
 |---|---|---|
 | `A2_SITES_CONF` | ~/.aria2/search-sites.conf | **a2-search** 的站点配置（a2 不读） |
 | `A2_SEARCH_TIMEOUT` | 20 | 单次抓取超时（秒）；cmd 源上限是它的 3 倍 |
-| `A2_SEARCH_PROXY` | 空 | 给抓取指定代理，如 `http://127.0.0.1:7897` |
+| `A2_SEARCH_PROXY` | 空 | 给抓取指定代理（也可写进 search-sites.conf 的 `proxy=`，环境变量优先） |
 | `A2_SEARCH_DEBUG` | 空 | 1=打印完整 cmd 源命令（可能含 token，谨慎） |
 | `A2_VERIFY_TIMEOUT` | 90 | `a2-verify` 的元数据校验超时（秒） |
 | `A2_VERIFY_DIR` | ~/.aria2/tor-cache | 校验任务临时目录（别指向媒体库目录） |
