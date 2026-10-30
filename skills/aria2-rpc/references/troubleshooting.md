@@ -56,8 +56,8 @@ Linux `systemctl --user status <服务名>`，Windows `schtasks /Query /TN "<服
   处置：先腾空间，再 `: > ~/.aria2/aria2.session`，最后重启服务
 - 另一处假死是 `pause` 撞在 ~97% 上，卡在 `DefaultBtProgressInfoFile::save()` 的 `rename()`
 - 预防：`file-allocation=none`、`enable-mmap=false`（mmap 脏页回写会拖长 fsync）、`auto-save-interval=300`、别把盘写满（见下）
-- **默认的空间保护**：`a2 add` 在目标盘剩余 < `A2_MIN_FREE_GB`（默认 20 GB）时拒绝加任务，
-  并在提示里给出剩余空间；临时放宽 `A2_MIN_FREE_GB=5 a2 add …`
+- **空间保护在 skill 层**：`a2-dest check DIR` 在剩余 < `A2_MIN_FREE_GB`（默认 20 GB）时拒绝，
+  并给出剩余空间；临时放宽 `A2_MIN_FREE_GB=5 a2-dest check …`（`a2 add` 不做这个判断）
 - 外接盘上文件"虚大"是正常的（高位分片零填充），**真实进度看 RPC 的 `completedLength`**，别看 `ls` 的大小
 - macOS 备注：想在线检查媒体盘又不想停正在播的服务，`diskutil verifyVolume <挂载点>` 可以**在线**做
   （它会退回 `fsck_hfs -fn -l -x`）；要停别的 launchd 服务得 `launchctl bootout` 那个 job，`pkill` 只会被 respawn
@@ -80,7 +80,7 @@ Linux `systemctl --user status <服务名>`，Windows `schtasks /Query /TN "<服
 | 空闲时 `lsof` 看不到 BT 监听端口 | BT 端口是**懒绑定**的，有任务时才出现（Windows 用 `netstat -ano \| findstr <端口>`）。不要因此"修"配置 |
 | `seed-time=0` 与 `seed-ratio` | 设了 `seed-time` 后，到时间或到比率**任一**满足就停止做种（man 页），所以 `seed-ratio` 基本是死配置。不想做种就 `seed-time=0` |
 | 上传占满上行 | 保留 `max-overall-upload-limit`（模板给 2M）。它是全局选项，也能运行时改：`aria2.changeGlobalOption {"max-overall-upload-limit":"2M"}` |
-| 冷门资源一直 0 速度 | 公共 BT 的正常现象，`bt-stop-timeout=0` 时不会自停。用 `a2 add --verify` 的元数据校验判断"到底有没有人在做种" |
+| 冷门资源一直 0 速度 | 公共 BT 的正常现象，`bt-stop-timeout=0` 时不会自停。用 `a2-verify <磁力>` 判断"到底有没有人在做种" |
 
 ## 7. 落点（谁决定下到哪）与媒体库
 
@@ -91,7 +91,7 @@ Linux `systemctl --user status <服务名>`，Windows `schtasks /Query /TN "<服
   改过一次就长期沿用。`media-root` 是媒体库根，未设置时等于 `download-dir`
 - **启动器也读同一份配置**：`download-dir` / `media-root` 任一在当前机器上不可用（外接盘没挂载），
   `start-aria2.sh` 直接拒绝启动，避免把几十 GB 写进系统盘。设 `A2_FALLBACK_DIR` 可临时回退
-- **空间**：`a2 add` 在目标盘剩余 < `A2_MIN_FREE_GB`（默认 20 GB）时拒绝加任务
+- **空间**：`a2-dest check` 在剩余 < `A2_MIN_FREE_GB`（默认 20 GB）时拒绝
 - 需要校验文件是否完整（截断的 mp4 报 `moov atom not found` 之类）就自己跑 `ffprobe`：a2 不再做这道校验
 
 ## 8. RPC 与 a2 本身

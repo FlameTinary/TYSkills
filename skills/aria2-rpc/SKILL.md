@@ -1,14 +1,17 @@
 ---
 name: aria2-rpc
-description: aria2 下载中枢（a2 优先，macOS / Linux / Windows(WSL) 通用）。a2 只做两件事：**下载到你给的目录**（add --dir，可选 --verify 先验真做种）与**任务管理**（ls/st/info/files/pause/resume/rm/purge/up/down）。**搜索在本技能这一层**：a2-search 在你自己配置的站点里搜（site= HTML 结果页自动抽磁力 / site=cmd: 自写源），并支持 --discover 全网发现结果页（websearch= 可配任意搜索页），脚本不内置任何资源站；**落点也在本技能**：a2-dest 首次按 OS 生成默认下载目录并持久化，电影/剧集/私藏等子目录由技能决定。另含 AList 网盘全流程（install-alist.sh / setup-aliyun.sh / a2-ls / a2-alist / a2-alist-dir / a2-aliyun）、一键部署（install-a2.sh，自动按平台装服务：macOS launchd / Linux systemd --user / Windows 计划任务）。a2 未覆盖的能力——select-file 只下整季包里的部分集、bt-metadata-only 定制校验、addTorrent 自定义选项、按需字段查询——用裸 aria2 JSON-RPC（scripts/aria2_cli.py 或 curl）。当用户提到 aria2、a2、下载器、磁力/BT 下载、种子搜索、找资源/搜资源、AList、网盘直链、下载任务管理、限速/暂停/继续、默认下载目录/落点配置时使用。
+description: aria2 下载中枢（macOS / Linux / Windows(WSL) 通用）。**a2 只对资源做增删改查**：增 add --dir（下到调用方给的目录）、删 rm/purge、改 pause/resume/concurrent/up/down、查 ls/st/info/files；不搜索、不决定落点、不分类、不改名、不验证资源好坏。**其余全在本技能这一层**：搜索 a2-search（站点自配，`site=` HTML 结果页自动抽磁力或 `cmd:` 自写源，`--discover` 全网发现，脚本不内置任何资源站）、落点 a2-dest（首次按 OS 生成默认目录并持久化；`check` 做挂载/建目录/剩余空间检查）、资源校验 a2-verify（bt-metadata-only 验真做种）。另含 AList 网盘全流程（install-alist.sh / setup-aliyun.sh / a2-ls / a2-alist / a2-alist-dir / a2-aliyun）、一键部署（install-a2.sh，自动按平台装服务：macOS launchd / Linux systemd --user / Windows 计划任务）。a2 未覆盖的能力——select-file 只下整季包里的部分集、addTorrent 自定义选项、按需字段查询——用裸 aria2 JSON-RPC（scripts/aria2_cli.py 或 curl）。当用户提到 aria2、a2、下载器、磁力/BT 下载、种子搜索、找资源/搜资源、AList、网盘直链、下载任务管理、限速/并发/暂停/继续、默认下载目录/落点配置时使用。
 ---
 
 # a2 + Aria2 RPC 下载中枢
 
-**职责三分**，越界就会乱：
-- **a2**：只下载（`add --dir …`，可选 `--verify` 先验真做种）和管任务，不搜索、不推断分类、不改名、不搬动；
+**职责四分**，越界就会乱：
+- **a2**：只对资源做**增删改查**（`add` / `rm` `purge` / `pause` `resume` `concurrent` `up` `down` / `ls` `st` `info` `files`）。
+  不搜索、不建目录、不算空间、不判断盘挂没挂载、不分类、不改名、不判断资源好坏；
 - **a2-search（技能层）**：搜索。在你自己配置的站点里搜，并支持全网发现；不内置任何资源站；
-- **本文件的工作流（技能层）**：落点决策（`a2-dest` + 分类子目录）、搜索策略、下载前后的检查。
+- **a2-dest（技能层）**：落点。默认目录（首次按 OS 生成并持久化）+ `check` 落点检查（挂载/建目录/剩余空间）；
+- **a2-verify（技能层）**：资源好坏。bt-metadata-only 从 DHT 拉真实元数据，判断「真有人在做种」。
+- 本文件的工作流把上面几件串起来：先搜 → 选 → 校验 → `a2-dest check` 定落点 → `a2 add`。
 **凡 a2 有子命令的操作一律用 a2；a2 没有的才用裸 RPC。**
 
 ## 1. 系统布局（先确认这些在）
@@ -16,7 +19,8 @@ description: aria2 下载中枢（a2 优先，macOS / Linux / Windows(WSL) 通�
 | 路径 | 作用 |
 |---|---|
 | `~/.local/bin/a2` | a2 命令（软链 → `~/.aria2/a2`） |
-| `~/.local/bin/a2-dest` | **落点配置命令（技能层）**：首次运行按 OS 生成默认下载目录并持久化；`set` 改默认值 |
+| `~/.local/bin/a2-dest` | **落点命令（技能层）**：默认下载目录（首次按 OS 生成并持久化）、`set`/`media` 改配置、`check DIR` 落点检查 |
+| `~/.local/bin/a2-verify` | **资源校验命令（技能层）**：`a2-verify <磁力|file.torrent>` 验真做种（退出码 0/1） |
 | `~/.aria2/dest.conf` | 落点配置：`download-dir=` / `media-root=`。**a2 不读它**（a2 只认 `--dir`），skill 与启动器读 |
 | `~/.aria2/aria2.conf` | **aria2** 的配置：RPC 端口、rpc-secret、BT/tracker（只放 aria2 认识的键） |
 | `~/.local/bin/a2-search` | **搜索命令（技能层）**：在 `search-sites.conf` 的站点里搜，`--discover` 做全网发现 |
@@ -25,9 +29,13 @@ description: aria2 下载中枢（a2 优先，macOS / Linux / Windows(WSL) 通�
 | `~/.aria2/start-aria2.sh` | 启动器：校验 `dest.conf` 里的落点目录可用（不存在且会建到系统盘上就拒绝启动）；终端/服务管理器/cron 统一入口 |
 | 服务定义（守护进程） | macOS `~/Library/LaunchAgents/<服务名>.plist`（launchd）｜Linux `~/.config/systemd/user/<服务名>.service`（systemd --user）｜Windows 计划任务 / nssm —— 默认服务名 `com.example.aria2`，崩溃自动拉起 |
 
-可配置常量（环境变量覆盖）：目标盘最小剩余空间 `A2_MIN_FREE_GB`（默认 20，可 `A2_MIN_FREE_GB=5 a2 add …` 临时放宽）、
-服务名 `A2_SERVICE`（默认 `com.example.aria2`）、落点配置路径 `A2_DEST_CONF`（默认 `~/.aria2/dest.conf`）、
-站点配置路径 `A2_SITES_CONF`（默认 `~/.aria2/search-sites.conf`）、校验超时 `A2_VERIFY_TIMEOUT`（默认 90 秒）。
+可配置常量（环境变量覆盖）：
+- 落点策略（`a2-dest` 读）：最低剩余空间 `A2_MIN_FREE_GB`（默认 20，0=不检查）、
+  允许在系统盘上建目录 `A2_ALLOW_CREATE=1`、配置文件 `A2_DEST_CONF`；
+- 搜索（`a2-search` 读）：站点配置 `A2_SITES_CONF`、抓取超时 `A2_SEARCH_TIMEOUT`、代理 `A2_SEARCH_PROXY`；
+- 校验（`a2-verify` 读）：超时 `A2_VERIFY_TIMEOUT`（默认 90 秒）、临时目录 `A2_VERIFY_DIR`；
+- 服务名 `A2_SERVICE`（默认 `com.example.aria2`）——a2 报错提示用。
+**注意**：`A2_MIN_FREE_GB` / `A2_ALLOW_CREATE` 现在只影响 `a2-dest check`；`a2 add` 自己不再做任何空间/挂载判断。
 默认下载目录与媒体库根**不再走环境变量**：它们持久化在 `dest.conf`，用 `a2-dest set` / `a2-dest media set` 改
 （`A2_DOWNLOAD_DIR` / `A2_MEDIA_ROOT` 只作为 AList 助手脚本的临时覆盖保留）。
 落点可以在**任何**盘上（内置盘、外接盘、网络盘、Linux 的 `/mnt/…`、Windows 的 `D:\…`）。
@@ -54,10 +62,13 @@ curl -s -o /dev/null -w "%{http_code}" http://localhost:5244   # AList（网盘�
 | 查/改默认下载目录（首次按 OS 生成） | `a2-dest` / `a2-dest set <目录>` / `a2-dest media […]` |
 | 在**你配置的站点**里搜资源 | `a2-search <关键词>`（站点在 `search-sites.conf`，见 §5.2） |
 | 不知道去哪搜 / 站点都不命中 | `a2-search --discover <关键词>` → 结果页链接交给 agent 的 web 工具 |
-| 下载搜到的磁力（可选先验真做种） | `a2 add --dir <目录> --verify "<磁力>"` |
+| 判断一条资源「真有人在做种」吗 | `a2-verify <磁力>`（退出码 0=可下，1=拿不到元数据） |
+| 落点是否可用 / 建目录 / 看剩余空间 | `a2-dest check <目录>`（打印绝对路径） |
+| 下载选好的磁力 | `a2 add --dir <目录> "<磁力>"` |
 | 查看任务/单任务详情/任务内文件 | `a2 ls` / `a2 st` / `a2 info <gid>` / `a2 files <gid>` |
 | 暂停/继续/移除/清空 | `a2 pause [force] <gid\|all>` / `a2 resume` / `a2 rm` / `a2 purge` |
 | 上下行限速（本次运行有效） | `a2 up 1M` / `a2 down 0` |
+| 同时下载几个任务（本次运行有效） | `a2 concurrent 5`（不带参数=查看） |
 | AList 安装 / 启动 / 云盘接入 / 验证 | `install-alist.sh` / `start-alist.sh` / `setup-aliyun.sh`（见 §5.4） |
 | AList 网盘浏览/单文件下载/目录批量下载 | `a2-ls` / `a2-alist` / `a2-alist-dir` / `a2-aliyun` |
 | **整季包里只下指定集**（select-file）、定制元数据校验、addTorrent 自定义选项、自定义全局选项 | **裸 RPC**（见 §5.3） |
@@ -68,26 +79,31 @@ RPC 报错先看 `~/.aria2/aria2.conf` 的端口/secret 是否被改。
 ## 4. a2 命令速查
 
 ```bash
+# —— a2：资源的增删改查 ——
+a2 add --dir <目录> [-p] [-o 文件名] <url|magnet|file.torrent|urls.txt> ...
+a2 rm <gid|all>      a2 purge                       # 删
+a2 pause [force] <gid|all>   a2 resume <gid|all>    # 改：暂停/继续
+a2 concurrent [N]    a2 up <rate|0>   a2 down <rate|0>   # 改：并发数 / 限速
+a2 ls [-a] [--name 片段]   a2 st   a2 info <gid>   a2 files <gid>   # 查
+
+# —— skill 层 ——
 a2-dest                                   # 默认下载目录（首次运行按 OS 生成并持久化）
-a2-dest set <目录>                        # 改默认下载目录（持久化，后续沿用）
-a2-dest media                             # 媒体库根（未设置 = 默认下载目录）
-a2-dest media set <目录>                  # 单独指定媒体库根
-a2 add --dir <目录> [--verify] [-p] [-o 文件名] <url|magnet|file.torrent|urls.txt> ...
+a2-dest check <目录>                       # 落点检查：挂载/建目录/剩余空间，打印绝对路径
+a2-dest set <目录> / media [set <目录>]     # 改默认下载目录 / 媒体库根
+a2-verify <磁力|file.torrent> [--json]      # 验真做种（退出码 0/1）
 a2-search <关键词> [--pages N] [--min-seeds N] [--res 1080p] [--prefer 组A,组B] [--all] [--json]
 a2-search --discover <关键词> [--json]        # 全网发现：列出结果页链接
 a2-search sites                               # 列出已配置的站点/搜索源
-a2 ls [-a]   a2 st   a2 info <gid>   a2 files <gid>
-a2 pause [force] <gid|all>   a2 resume <gid|all>   a2 rm <gid|all>   a2 purge
-a2 up <rate|0>   a2 down <rate|0>
 a2-ls <AList路径>   a2-alist <AList路径> [输出目录]   a2-alist-dir <AList目录> [输出目录] [过滤]
 ```
 
 要点（坑都在这里）：
-- **落点必须显式**：`a2 add` 不带 `--dir` 直接报错。a2 不推断分类、不进暂存区、不改名、不搬动——文件就落在你给的目录里。
+- **落点必须显式**：`a2 add` 不带 `--dir` 直接报错；目录不存在也直接报错（a2 不建目录）。
+  默认目录、分类子目录、挂载与空间检查都在 `a2-dest`（`a2-dest check`）。
 - **搜索不在 a2 里**：`a2 find` / `a2 grab` 已移除，执行时会打印新用法。搜索用 `a2-search`（§5.2），
   它同样做过滤与排序：电影分类全留、剧集必须命中「整季/全集」且排除单集 SxxExx、噪音（3D/SBS/Hindi/FLAC/电子书）剔除，`--all` 全关。
-- **`--verify` 是下载控制**（bt-metadata-only，最长 `A2_VERIFY_TIMEOUT` 秒）：搜索结果页标的做种数会撒谎，
-  拿不到元数据就跳过该条。不想等就别加这个参数。
+- **资源好坏用 `a2-verify`**（bt-metadata-only，最长 `A2_VERIFY_TIMEOUT` 秒）：搜索结果页标的做种数会撒谎，
+  拿不到元数据就别下（退出码 1）。它是 skill 层的判断工具，不是 a2 的下载参数。
 - **站点由使用者配置**：`~/.aria2/search-sites.conf` 里一行一个 `site=`；不内置任何资源站。
   站点改版导致抓不到时，换 URL、换站点，或写成 `cmd:` 源自己解析（契约见 `references/search-sites.md`）。
 - **a2-search 不做缓存/序号**：它每次直接抓（`--pages` 翻页），磁力随 `--json` 一起给出，选哪条由 agent/用户决定。
@@ -95,35 +111,35 @@ a2-ls <AList路径>   a2-alist <AList路径> [输出目录]   a2-alist-dir <ALis
 
 ## 5. 核心工作流
 
-### 5.1 落点决策 + 下载
+### 5.1 落点决策 + 下载（搜到之后）
 
-**决策顺序（技能这一层，a2 完全不参与）**：
+**决策顺序（技能层，a2 完全不参与）**：
 
 1. 基目录 = `a2-dest`（首次运行按当前 OS 生成：macOS `~/Downloads`、Linux 遵循 XDG `XDG_DOWNLOAD_DIR`（本地化后可能叫 `~/下载`）、Windows `%USERPROFILE%\Downloads`），持久化在 `~/.aria2/dest.conf`；
 2. 媒体库根 = `a2-dest media`（未单独设置时等于基目录）；
 3. 需要分类时由**本技能**决定子目录：电影 → `<媒体库根>/Movies`，剧集 → `<媒体库根>/TV`，私藏 → `<媒体库根>/Private`，普通文件 → 基目录；
-4. 把选好的目录传给 a2：`a2 add --dir <该目录> <输入>`。
+4. `a2-dest check <目录>`：盘在不在（外接盘挂没挂）、建不建得出来、剩余空间够不够 —— 返回可用的绝对路径；
+5. `a2 add --dir <该路径> <输入>`；要按名字落文件就再加 `-o 文件名`。
 
 ```bash
-a2-dest                                     # 看默认下载目录（首次会自动生成并落盘）
-a2-dest set /Volumes/磁盘/Downloads          # 改默认（持久化，后续下载沿用）
-a2-dest media set /Volumes/磁盘/media         # 媒体库根单独指定
+DEST=$(a2-dest check "$(a2-dest)")                  # 普通文件：默认目录
+DEST_TV=$(a2-dest check "$(a2-dest media)/TV")       # 剧集：子目录由技能选，check 负责建/校验
+a2-dest set /Volumes/磁盘/Downloads                  # 改默认下载目录（持久化）
+a2-dest media set /Volumes/磁盘/media                 # 媒体库根单独指定
 
-DEST=$(a2-dest); MEDIA=$(a2-dest media)
-mkdir -p "$MEDIA/Movies" "$MEDIA/TV" "$MEDIA/Private"   # 分类子目录由 skill 负责建
-
-a2 add --dir "$DEST" "https://example.com/x.zip"         # 普通文件 → 默认下载目录
-a2 add --dir "$MEDIA/TV" "magnet:?xt=urn:btih:…"          # 剧集 → 子目录由 skill 选
-a2 add --dir "$MEDIA/Movies" -o "某电影.mkv" "https://…"  # -o 只改文件名，不改目录
-a2 ls; a2 st
+a2 add --dir "$DEST" "https://example.com/x.zip"           # 普通文件
+a2 add --dir "$DEST_TV" "magnet:?xt=urn:btih:…"             # 剧集
+a2 add --dir "$DEST_TV" -o "某剧.S01E01.mkv" "https://…"    # -o 只改文件名，不改目录
+a2 ls --name 某剧; a2 st
 ```
 
 判分类的依据（只在 skill 侧，脚本里没有）：标题命中 `S01E02` / `1x02` / `第03集` / `第二季` / `全24集` / `合集` /
 `Season 2` / 只写季号的整季包（`Show S01 COMPLETE 1080p`）→ 剧集；含年份或 `1080p/2160p/BluRay/WEB-DL` → 电影；
 其余落默认下载目录。拿不准就问用户，别猜。
 
-**a2 侧只有这些参数**：`--dir`（必填）、`-p`（加入后暂停）、`-o`（文件名）。输入类型仍是
-`url | magnet | file.torrent | urls.txt`（每行一个链接，`#` 注释）。空间不足（`A2_MIN_FREE_GB`）会拒绝加任务。
+**a2 侧只有三个下载参数**：`--dir`（必填）、`-p`（加入后暂停）、`-o`（文件名）。
+输入类型是 `url | magnet | file.torrent | urls.txt`（每行一个链接，`#` 注释）。
+空间不足/盘没挂载这类事 `a2-dest check` 早就挡掉了；它没挡就说明可以下。
 
 ### 5.2 搜索：找资源是本技能的活，a2 只管下
 
@@ -142,13 +158,14 @@ a2-search sites                                  # 先看有哪些站点可用
 a2-search "关键词 压制组" --res 1080p              # 在配置站点里搜（默认过滤见 §4）
 a2-search 关键词 --json | jq '.[0].magnet'        # 拿完整磁力（选哪条自己定）
 a2-search --discover "关键词"                     # 站点都不命中时：先找页面
-a2 add --dir "$(a2-dest media)/TV" --verify "<磁力>"   # 落点 + 先验真做种再下
+a2-verify "<磁力>"                                # 选中的那条：先验真做种（0=可下，1=别下）
+a2 add --dir "$(a2-dest check "$(a2-dest media)/TV")" "<磁力>"   # 落点检查 + 下载
 ```
 
 要点：
 - **过滤规则在搜索侧**：电影分类全留；剧集必须命中整季/全集且不是单集；噪音剔除；`--all` 关掉全部过滤。
   分辨率 `--res`、做种阈值 `--min-seeds`（seeds 未知的行不参与，HTML 页常见）、压制组优先 `--prefer` 都可叠加。
-- **搜索结果可不可信看 `--verify`**：`a2 add --verify` 用 bt-metadata-only 从 DHT 拉真实元数据，拉不到就跳过。
+- **搜索结果可不可信看 `a2-verify`**：bt-metadata-only 从 DHT 拉真实元数据，拉不到（退出码 1）就别下。
 - **站点抓不到 ≠ 没资源**：HTML 模式只认页面里的 `magnet:` 链接；结果页是 JS 渲染时，改用 `cmd:` 源
   （自己请求 API/解析），或换站点。`A2_SEARCH_PROXY=http://127.0.0.1:7897` 可给抓取指定代理。
 - **不要手写搜索**：先看 `a2-search sites` 与 `search-sites.conf`，再考虑全网发现；同一关键词别反复翻 10 页。
@@ -223,7 +240,7 @@ a2-alist-dir "/aliyun/剧集" "$(a2-dest media)/TV" "*.mkv"
 4. **服务管理器下不能 `--daemon=true`**：fork 后父进程退出 → launchd 的 `KeepAlive` / systemd 的 `Restart=always` / 计划任务会反复拉起。必须前台跑。
 5. **BT 端口懒绑定**：空闲时 `lsof` 看不到监听端口是正常的，有任务才出现。
 6. **完成判据只能是 RPC**（`completedLength == totalLength > 0`）。`force-save=true` 让已完成的 `.aria2` 控制文件
-   永久残留 ——「没有控制文件才算下完」从来就不成立。
+   永久残留 ——「没有控制文件才算下完」从来就不成立（`a2 ls -a` / `a2 info` 看的就是 RPC 的这两个字段）。
 7. **完成的任务要 `removeDownloadResult` + `saveSession`**：否则重启会把已经下好的大种子再下一遍。
 8. **别在下任务运行时删 `.aria2`**：会出现 `Failed to write into the segment file`。顺序是 `a2 rm` → `a2 purge` → 再删文件。
 9. **`log-level=info` 会吃掉磁盘**（按 peer×piece 写，实测 23.7 GB）且 aria2 不自带轮转：保持 `warn`。
@@ -245,10 +262,11 @@ a2-alist-dir "/aliyun/剧集" "$(a2-dest media)/TV" "*.mkv"
 | `a2-search` 说「还没有配置站点」 | 在 `~/.aria2/search-sites.conf` 加 `site=` 行，见 references/search-sites.md |
 | `a2-search` 抓到 0 条磁力 | 结果页可能改版/是 JS 渲染：换站点 URL、改 `cmd:` 源，或 `--discover` 找别的页 |
 | `a2-search` 报 cmd 源失败/超时/非 JSON | 源的问题，不是脚本：先单独跑那条命令；`A2_SEARCH_DEBUG=1` 打印完整命令 |
-| `a2 add --verify` 一直跳过 | DHT 上没有节点给元数据（真没人做种）；换一条，或去掉 `--verify` 强下 |
+| `a2-verify` 一直拿不到元数据 | DHT 上没节点给数据（真没人做种）；换一条，或直接下（`a2 add` 不拦） |
 | 任务 0 速度 / 卡在元数据 | 公共 BT 冷门资源正常；`bt-stop-timeout=0` 不会自停；查 `~/.aria2/aria2.log`（需细查临时改 `info` 并重启） |
-| `a2 add` 报「缺少目标目录」 | a2 不推断落点：`a2 add --dir "$(a2-dest)" …`；要换默认值就 `a2-dest set <目录>` |
-| 目标盘空间不足被拒 | `A2_MIN_FREE_GB=5 a2 add …` 临时放宽；或清理磁盘 |
+| `a2 add` 报「缺少目标目录」/「目录不存在」 | a2 不推断落点也不建目录：先 `a2-dest check <目录>` 拿到路径再 `--dir` |
+| `a2-dest check` 报剩余空间不足 | 清理磁盘，或 `A2_MIN_FREE_GB=5 a2-dest check …` 临时放宽（`0`=不检查） |
+| `a2-dest check` 报落点不可用（系统盘） | 外接盘/网络盘没挂载；挂好后重试，或 `A2_ALLOW_CREATE=1`（确实要放系统盘） |
 | 下载失败看似全挂 | 先确认不是 `bt-stop-timeout` 误设；errorCode=7 = 未完成数据 |
 | 外接盘文件「虚大」 | 不支持稀疏文件的文件系统（如 HFS+）零填充占块；真实进度以 RPC completedLength 为准 |
 | 播不了的视频 | 截断的容器（ffprobe 报 `moov atom not found`）：a2 已不做入库校验，自己 `ffprobe <文件>` 确认后重下 |
@@ -259,13 +277,14 @@ a2-alist-dir "/aliyun/剧集" "$(a2-dest media)/TV" "*.mkv"
 
 | 文件 | 作用 |
 |---|---|
-| `scripts/a2` | 主程序（add + 任务管理 + `--verify` 真做种校验；不搜索） |
+| `scripts/a2` | 主程序：**只做资源的增删改查**（add / rm / purge / pause / resume / concurrent / up / down / ls / st / info / files） |
+| `scripts/a2-verify` | **资源校验**（技能层）：bt-metadata-only 验真做种，`--json` 给脚本用，退出码 0/1 |
 | `scripts/a2-search` | **搜索**（技能层）：配置站点（HTML/命令两种）里搜、过滤排序、`--discover` 全网发现 |
 | `scripts/search-source-demo.py` | 离线自测 cmd 源（不联网，验证「搜 → 选 → 下」流程） |
 | `scripts/search-source-template.py` | 接入自己站点的 cmd 源骨架 |
 | `scripts/aria2_cli.py` | 裸 RPC 客户端（a2 没覆盖的能力；端口/密钥自动读 conf） |
 | `scripts/a2-dest` | **落点配置**（技能层）：首次按 OS 生成默认下载目录、持久化、读取/修改（`--json` 供脚本用） |
-| `tests/` | `python3 -m unittest discover -s tests`（add/--verify、已删参数、a2-dest、a2-search 解析与过滤） |
+| `tests/` | `python3 -m unittest discover -s tests`（a2 CRUD、a2-verify、a2-dest check、a2-search 解析与过滤） |
 | `scripts/start-aria2.sh` | 启动器：校验 `dest.conf` 里落点目录可用（跨平台判据）+ 统一启动路径 |
 | `scripts/install-a2.sh` | 一键部署（幂等；按平台装 launchd / systemd / 计划任务服务） |
 | `scripts/install-alist.sh` / `scripts/setup-aliyun.sh` | AList 安装 / 云盘接入 |

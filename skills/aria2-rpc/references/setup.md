@@ -27,7 +27,7 @@ A2_SERVICE=a2.你的名字 bash scripts/install-a2.sh
 
 1. 依赖检查（aria2c/python3/curl），缺失时按平台给安装命令；
 2. 建 `~/.aria2`，touch 空 `aria2.session` / `aria2.log`（session 文件不存在 aria2 会直接退出）；
-3. 安装核心脚本：`a2`、`start-aria2.sh` → `~/.aria2/`，`a2-dest` / `a2-search` → `~/.local/bin`；
+3. 安装核心脚本：`a2`、`start-aria2.sh` → `~/.aria2/`，`a2-dest` / `a2-search` / `a2-verify` → `~/.local/bin`；
 4. 首次运行 `a2-dest`：按当前 OS 生成默认下载目录并写入 `~/.aria2/dest.conf`（已存在则沿用，不覆盖用户改过的值）；
 5. `~/.local/bin/a2` 软链到 `~/.aria2/a2`；AList 四件套复制到 `~/.local/bin`（不在 PATH 会给出提示）；
 6. 搜索源脚本 `search-source-demo.py` / `search-source-template.py` → `~/.aria2/`，并生成 `search-sites.conf`（不覆盖已有的）；
@@ -91,10 +91,11 @@ a2-dest media      # 媒体库根（未设置 = 默认下载目录）
 
 - 「电影 / 剧集 / 私藏」这类子目录由**技能**拼：`$(a2-dest media)/Movies`、`/TV`、`/Private`（需要就 `mkdir -p`）；
 - 落点可以放在**任何**盘上：内置盘、外接盘、网络盘、Windows 的 `D:\media`、Linux 的 `/mnt/xxx/media` 都行；
-- 启动器与 `a2 add` 会用同一条跨平台判据检查目标目录：**家目录内**、**落在别的盘上**都放行；
+- `a2-dest check DIR` 与启动器用同一条跨平台判据检查目标目录：**家目录内**、**落在别的盘上**都放行；
   只有「既不在家目录内、又会落在系统盘上」才拒绝（外接盘/网络盘没挂载时挂载点目录会凭空消失）。
   确认就要那个位置：先 `mkdir -p`，或设 `A2_ALLOW_CREATE=1`；
-- `A2_MIN_FREE_GB`（默认 20）是目标盘最低余量，不足直接拒绝加任务。
+- `A2_MIN_FREE_GB`（默认 20）是 `a2-dest check` 的余量阈值，不足直接拒绝（`0`＝不检查）。
+  `a2 add` 只要求目录已存在，不再做这两项判断。
 
 ## 5. AList 接入（可选，网盘下载用）
 
@@ -173,6 +174,6 @@ schtasks /End /TN "<服务名>" && schtasks /Run /TN "<服务名>"   # 重启
 | 现象 | 处理 |
 |---|---|
 | `a2` 报 RPC 不可用 | 确认守护在跑（macOS `launchctl print gui/$(id -u)/<服务名>`；Linux `systemctl --user status <服务名>`；Windows `schtasks /Query /TN "<服务名>" /V`），再核对 conf 的 `rpc-listen-port` |
-| 加任务被拒：目标目录不可用 | 外接盘/网络盘没挂载；挂载后重试，或 `A2_ALLOW_CREATE=1`（确实要放系统盘时） |
-| 加任务被拒：目标盘剩余不足 | `A2_MIN_FREE_GB=5 a2 add …` 临时放宽，或清理磁盘 |
-| `a2 add` 报「缺少目标目录」 | a2 不推断落点：`a2 add --dir "$(a2-dest)" …`；换默认值用 `a2-dest set <目录>` |
+| `a2-dest check` 报落点不可用 | 外接盘/网络盘没挂载；挂载后重试，或 `A2_ALLOW_CREATE=1`（确实要放系统盘时） |
+| `a2-dest check` 报剩余不足 | `A2_MIN_FREE_GB=5 a2-dest check …` 临时放宽，或清理磁盘 |
+| `a2 add` 报「缺少目标目录/目录不存在」 | 先 `a2-dest check <目录>`（会建目录并检查），再把返回的路径给 `--dir` |

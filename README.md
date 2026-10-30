@@ -10,7 +10,7 @@
 
 | 技能 | 一句话说明 | 适用平台 | 详细说明 |
 |---|---|---|---|
-| [aria2-rpc](skills/aria2-rpc/) | aria2 下载中枢：`a2` 只管下载（`--dir` 显式落点 + `--verify` 验真做种）与任务管理；`a2-dest` 默认下载目录（按 OS 生成并持久化）；`a2-search` 在**你自己配置的站点**里搜 + 全网发现（不内置资源站）；限速/暂停/继续、AList 网盘直链、一键部署为守护服务 | macOS / Linux / Windows(WSL、Git Bash) | [README](skills/aria2-rpc/README.md) |
+| [aria2-rpc](skills/aria2-rpc/) | aria2 下载中枢：`a2` **只对资源做增删改查**（add / rm / pause·resume·concurrent·限速 / ls·info·files）；搜索 `a2-search`（站点自配 + 全网发现，不内置资源站）、落点 `a2-dest`（默认目录 + check 挂载/空间）、资源校验 `a2-verify` 都在技能层；AList 网盘直链、一键部署为守护服务 | macOS / Linux / Windows(WSL、Git Bash) | [README](skills/aria2-rpc/README.md) |
 | [obsidian-para](skills/obsidian-para/) | Obsidian 知识库的 PARA（项目/领域/资源/归档）顾问与执行助手：归类决策树、目录结构规范、frontmatter 规范、4 套笔记模板 + 4 个成品 MOC、10 条 Dataview 查询、旧库迁移与复盘归档流程、库体检脚本 | macOS / Linux / Windows | [README](skills/obsidian-para/README.md) |
 | [skill-sanitize](skills/skill-sanitize/) | 技能脱敏：审计技能里的本机痕迹（路径/用户名/主机名/密钥/代理/私有域名）、按类处置（删除/参数化/占位/留痕保留）、需要私有化的值改成用户自己的配置文件 | macOS / Linux / Windows | [README](skills/skill-sanitize/README.md) |
 
@@ -36,7 +36,7 @@ skills/
 │   ├── SKILL.md              # 技能主文件：决策规则、工作流、踩坑清单（agent 读这个）
 │   ├── assets/               # 配置与服务定义模板（占位符由安装脚本替换）
 │   ├── references/           # 分主题参考文档（命令详解、搜索源契约、排错、AList API 等）
-│   ├── scripts/              # 可执行程序：a2、a2-search（搜索）、a2-dest（落点配置）、裸 RPC 客户端、安装/启动脚本
+│   ├── scripts/              # 可执行程序：a2（CRUD）、a2-search（搜索）、a2-dest（落点）、a2-verify（校验）、裸 RPC、安装脚本
 │   └── tests/                # python3 -m unittest discover -s tests（a2 add --dir / a2-dest 行为）
 ├── obsidian-para/
 │   ├── README.md             # 本技能完整说明：简介 / 依赖 / 安装 / 使用方法 / 参考文档

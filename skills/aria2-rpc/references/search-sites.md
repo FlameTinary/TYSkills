@@ -86,13 +86,13 @@ a2-search 关键词 --json             # 完整行（含 magnet），选哪条�
 a2-search --discover 关键词          # 全网发现：列出结果页链接
 ```
 
-- **没有缓存、没有序号**：每次都是现抓，`--json` 里的 `magnet` 直接喂给 a2：
-  `a2 add --dir "$(a2-dest media)/TV" --verify "<magnet>"`
+- **没有缓存、没有序号**：每次都是现抓，`--json` 里的 `magnet` 直接往下走：
+  `a2-verify "<magnet>"`（验真做种，0/1）→ `a2 add --dir "$(a2-dest check "$(a2-dest media)/TV")" "<magnet>"`
 - 过滤与排序都在搜索侧（分类判定见下）；`--res` / `--min-seeds` / `--prefer` 可叠加：
   - 电影分类 → 直接留；剧集分类 → 必须命中「整季/全集」且不是单集 `SxxExx`；其它分类 → 默认不要
   - 分类来源：源给的 `category`，没给就按标题猜（`S01E02`/`S01`/`第N季`/`全N集`/`合集`/`Season N` → TV；
     年份或 `1080p` 等 → Movies）
-- 落点仍由技能决定（`a2-dest` / `a2-dest media`），a2 只下到 `--dir`；`--verify` 用 bt-metadata-only 验真做种。
+- 落点仍由技能决定（`a2-dest check` 负责建目录/挂载/空间），a2 只下到 `--dir`；资源好坏用 `a2-verify` 判。
 
 ## 5. 写自己的 cmd 源（要点）
 
