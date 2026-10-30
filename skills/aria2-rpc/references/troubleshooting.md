@@ -35,9 +35,8 @@ Linux `systemctl --user status <服务名>`，Windows `schtasks /Query /TN "<服
 ## 3. 完成判据、控制文件与会话
 
 1. **永远不要用「有没有 `<条目>.aria2` 控制文件」判断是否下完**。conf 的 `force-save=true`
-   让已完成的控制文件**永久残留**，而且完成时 aria2 的顺序是「下载完成 → 保存片段文件 → 执行 on-download-complete」，
-   所以钩子被调用时控制文件一定还在。判据只能是 RPC：`completedLength == totalLength > 0`
-   （`on-complete.py` / `a2 sweep` 就是这么做的）
+   让已完成的控制文件**永久残留**（a2 默认也不装完成钩子，没人替你搬文件）。判据只能是 RPC：
+   `completedLength == totalLength > 0`
 2. 完成的任务在 `force-save=true` 下**还会被写回 session**：入库之后要 `aria2.removeDownloadResult` + `saveSession`，
    否则下次重启把已经入库的几十 GB 再下一遍
 3. **清空 session 后又"回来"了**：正在退出的守护进程会在你截断之后又保存一次。顺序是
@@ -58,7 +57,7 @@ Linux `systemctl --user status <服务名>`，Windows `schtasks /Query /TN "<服
 - 另一处假死是 `pause` 撞在 ~97% 上，卡在 `DefaultBtProgressInfoFile::save()` 的 `rename()`
 - 预防：`file-allocation=none`、`enable-mmap=false`（mmap 脏页回写会拖长 fsync）、`auto-save-interval=300`、别把盘写满（见下）
 - **默认的空间保护**：`a2 add` 在目标盘剩余 < `A2_MIN_FREE_GB`（默认 20 GB）时拒绝加任务，
-  并在路由提示里给出剩余空间；临时放宽 `A2_MIN_FREE_GB=5 a2 add …`
+  并在提示里给出剩余空间；临时放宽 `A2_MIN_FREE_GB=5 a2 add …`
 - 外接盘上文件"虚大"是正常的（高位分片零填充），**真实进度看 RPC 的 `completedLength`**，别看 `ls` 的大小
 - macOS 备注：想在线检查媒体盘又不想停正在播的服务，`diskutil verifyVolume <挂载点>` 可以**在线**做
   （它会退回 `fsck_hfs -fn -l -x`）；要停别的 launchd 服务得 `launchctl bootout` 那个 job，`pkill` 只会被 respawn
@@ -83,22 +82,17 @@ Linux `systemctl --user status <服务名>`，Windows `schtasks /Query /TN "<服
 | 上传占满上行 | 保留 `max-overall-upload-limit`（模板给 2M）。它是全局选项，也能运行时改：`aria2.changeGlobalOption {"max-overall-upload-limit":"2M"}` |
 | 冷门资源一直 0 速度 | 公共 BT 的正常现象，`bt-stop-timeout=0` 时不会自停。用 `a2 grab` 的元数据校验判断"到底有没有人在做种" |
 
-## 7. 入库与媒体库
+## 7. 落点（谁决定下到哪）与媒体库
 
-- **完成判据只信 RPC**（见 §3.1）。钩子 `on-complete.py` 只有在任务目录位于 `<媒体库根>/.incoming/` 下才动作，
-  普通下载静默跳过
-- **ffprobe 守卫**：入库前会用 ffprobe 解析条目里最大的视频文件，解析不了（如 `moov atom not found` 的截断 mp4）
-  就留在暂存区不动。**服务管理器拉起的进程 PATH 很窄**（macOS launchd 里没有 Homebrew，Linux systemd --user
-  里通常没有 `/usr/local/bin`，Windows 计划任务里更是空的）—— 脚本在 PATH 之外还会去常见安装位置兜底找
-  ffprobe；只用 `shutil.which` 会静默关掉整个校验
-- **并发**：两个任务同一秒完成会让 aria2 并发调两次钩子，靠 `flock ~/.aria2/move.lock` 串行化；
-  日志里出现"另一个钩子实例还在忙"是正常跳过。（Windows 上 `flock` 不可用时钩子会退化为单实例串行，仍是安全的）
-- **文件没入库**：先 `a2 sweep`（它用同一套 RPC 判据 + ffprobe 守卫）；看 `~/.aria2/move.log`；
-  条目既不在"活动/等待"也不在"已结束"列表（结果被清/守护重启过）时，宁可留着让人看一眼，也不要猜
-- **文件名清洗** `nameclean.py`：入库时去掉站点广告（网址、`【…发布…】`、`地址发布页` 之类），
-  绝不动 `SxxExx` / `第N季` / 年份 / `1080p` / `x265` 这些刮削要用的信息；目录内部也洗（最多两层）
-- 媒体库根由 `A2_MEDIA_ROOT`（默认 `~/media`；Windows 上可写 `D:\media`）决定，含 `Movies` / `TV` / `Private`
-  三个子目录；下载先落 `A2_MEDIA_ROOT/.incoming/{Movies,TV,Private,_unsorted}`
+- **a2 只认 `--dir`**：不给就报错退出，不会退回默认库、也不会按名字猜目录。默认下载目录与分类子目录
+  属于技能层（`a2-dest` + SKILL.md §5.1），脚本里没有这套逻辑
+- **a2 不改名、不搬文件**：落点目录里出现什么就是 aria2 下的什么；需要改名/整理自己动手（或写裸 RPC 脚本）
+- **默认目录从哪来**：`a2-dest`（`~/.aria2/dest.conf` 的 `download-dir`），首次运行按当前 OS 生成并落盘；
+  改过一次就长期沿用。`media-root` 是媒体库根，未设置时等于 `download-dir`
+- **启动器也读同一份配置**：`download-dir` / `media-root` 任一在当前机器上不可用（外接盘没挂载），
+  `start-aria2.sh` 直接拒绝启动，避免把几十 GB 写进系统盘。设 `A2_FALLBACK_DIR` 可临时回退
+- **空间**：`a2 add` 在目标盘剩余 < `A2_MIN_FREE_GB`（默认 20 GB）时拒绝加任务
+- 需要校验文件是否完整（截断的 mp4 报 `moov atom not found` 之类）就自己跑 `ffprobe`：a2 不再做这道校验
 
 ## 8. RPC 与 a2 本身
 
@@ -107,7 +101,8 @@ Linux `systemctl --user status <服务名>`，Windows `schtasks /Query /TN "<服
   （`scripts/aria2_cli.py` 与 `a2` 都已处理）
 - `a2` 的端口/密钥来自 `~/.aria2/aria2.conf`（`rpc-listen-port` / `rpc-secret`），所以不用手动传；
   要临时覆盖用 `A2_SECRET`，要指向另一份配置用 `A2_CONF`
-- `a2` 的专有配置（`find` 的搜索源、服务名）在 `~/.aria2/a2.conf`，**不要写进 aria2.conf**
+- `a2` 的专有配置（`find` 的搜索源、服务名）在 `~/.aria2/a2.conf`，**不要写进 aria2.conf**；
+  落点配置在 `~/.aria2/dest.conf`（`a2-dest` 维护），a2 自己不读它
   （aria2 会为未知键打 `[WARN] Unknown option` 刷屏）
 - 服务名默认 `com.example.aria2`：安装时用 `A2_SERVICE=a2.<你的名字> bash scripts/install-a2.sh` 换掉；
   `a2.conf` 里的 `service=` 保持同一个名字，a2 报错时给的提示命令才是对的

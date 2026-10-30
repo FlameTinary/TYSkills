@@ -2,6 +2,24 @@
 
 a2 主程序：`~/.aria2/a2`（`~/.local/bin/a2` 是软链）。aria2 的端口/密钥自动从 `~/.aria2/aria2.conf` 读取（`rpc-listen-port`、`rpc-secret`）；a2 自己的配置（搜索源、服务名）在 `~/.aria2/a2.conf`。
 
+## 0. 落点配置：`a2-dest`（技能层，不是 a2 的选项）
+
+a2 自己**不决定任何落点**：`a2 add` / `a2 grab` 都必须显式给 `--dir`。默认目录与分类子目录的这一层决策在这里：
+
+```
+a2-dest                   # 打印默认下载目录；首次运行按 OS 生成并写入 ~/.aria2/dest.conf
+a2-dest set DIR           # 改默认下载目录（持久化，后续沿用）
+a2-dest media             # 打印媒体库根（未设置 = download-dir）
+a2-dest media set DIR     # 单独指定媒体库根
+a2-dest cat               # 打印配置文件路径与内容
+a2-dest --json            # {"config":…,"download-dir":…,"media-root":…}
+```
+
+- 首次调用就落盘（`~/.aria2/dest.conf`，`A2_DEST_CONF` 可换路径），不会每次重新猜；
+- 按 OS 生成默认值：macOS `~/Downloads`；Linux `XDG_DOWNLOAD_DIR`（读 `~/.config/user-dirs.dirs`，本地化后可能是 `~/下载`），退回 `~/Downloads`；Windows `%USERPROFILE%\Downloads`；
+- 需要「电影 / 剧集 / 私藏」时由技能拼子目录（`$(a2-dest media)/Movies|TV|Private`），a2 不认识这些分类；
+- 启动器 `start-aria2.sh` 会校验 `download-dir` 与 `media-root` 是否可用（盘没挂载就拒绝启动）。
+
 ## 全局行为
 
 - **gid 前缀**：所有接受 gid 的命令都支持 6 位以上前缀（如 `a2 info c44f16`）；`all` 表示全部任务。
@@ -10,30 +28,25 @@ a2 主程序：`~/.aria2/a2`（`~/.local/bin/a2` 是软链）。aria2 的端口/
 
 ---
 
-## 1. `a2 add` — 添加下载（默认入口，可省略 add 字样）
+## 1. `a2 add` — 添加下载到指定目录（默认入口，可省略 add 字样）
 
 ```
-a2 add [-p] [-m|-t|-P|-flat|-d 目录] [-o 文件名] <url|magnet|file.torrent|urls.txt> ...
+a2 add --dir DIR [-p] [-o 文件名] <url|magnet|file.torrent|urls.txt> ...
 ```
 
 选项：
 | 选项 | 含义 |
 |---|---|
+| `--dir DIR` | **必填**：下到 DIR（不存在则创建）。只负责下载，不改名、不搬动、不做分类 |
 | `-p` / `--pause` | 加入后先暂停 |
-| `-m` / `--movie` | 强制当电影 → `${A2_MEDIA_ROOT}/Movies` |
-| `-t` / `--tv` | 强制当剧集 → `${A2_MEDIA_ROOT}/TV` |
-| `-P` / `--private` | 强制当私藏 → `${A2_MEDIA_ROOT}/Private`（不看名字；成人/私藏资源用这个） |
-| `-d DIR` | 指定任意保存目录：直接落 DIR，不经暂存区、不自动改名/入库、钩子不碰 |
-| `-flat` | 强制落 aria2.conf 的 `dir`（不进媒体库） |
 | `-o 名字` | 指定保存文件名 |
 
-路由规则（`-d` 优先级最高，其次强制分类，然后看名字）：
-- 名字命中剧集正则（`S01E02`、`1x02`、`第03集`、`第二季`、`第1-4季`、`全24集`、`合集`、`Season 1`、`EP 3`，
-  以及**只写季号的整季包**如 `Show S01 COMPLETE 1080p`）→ 剧集；
-- 否则含年份/1080p/2160p/BluRay/WEB-DL 等质量词或视频扩展名 → 电影；
-- 都不是 → 普通下载落 conf 的 `dir`（默认 `~/Downloads`，可用 `A2_DOWNLOAD_DIR` 覆盖）；
-- 磁力/种子没带名称 → `.incoming/_unsorted`，下载完钩子按实际文件名判断再入库。
-- 目标目录不可用时拒绝加任务（跨平台判据：目录不存在且会被建到系统盘上 —— 通常是外接盘/网络盘没挂载）；目标盘剩余不足阈值也拒绝（见 §9 的 `A2_MIN_FREE_GB`）。
+行为：
+- **不给 `--dir` 直接报错退出**，不会退回任何「默认库」或按名字猜目录；
+- 目标目录不可用时拒绝加任务（跨平台判据：目录不存在且会被建到系统盘上 —— 通常是外接盘/网络盘没挂载）；
+  目标盘剩余不足阈值也拒绝（见 §8 的 `A2_MIN_FREE_GB`）；
+- 已删除的落点参数（`-m` / `-t` / `-P` / `-flat` / `-d`）现在会报「已移除的选项」并提示改用 `--dir`；
+- 落点的决策在技能层：基目录 `a2-dest`、分类子目录由技能拼（见 §0）。
 
 输入形式：URL、磁力、本地 `.torrent` 文件、文本文件（每行一个链接，`#` 注释）。
 
@@ -58,18 +71,18 @@ a2 find <关键词> [--pages N] [--min-seeds N] [--res 1080p] [--prefer 组A,组
 - `--json` 打印规范化后的行 —— 调源时最好用这个看字段到底有没有被认出来
 - 缓存位置可用 `A2_FIND_CACHE` 覆盖（测试/多实例）；`A2_TOR_DEBUG=1` 会打印完整源命令与源 stderr
 
-## 3. `a2 grab` — 按搜索结果入库
+## 3. `a2 grab` — 按搜索结果下载
 
 ```
-a2 grab <序号|标题片段|infohash|磁力> [-t|-m|-P|-flat|-d 目录] [-p] [-o 名字] [--no-verify]
+a2 grab <序号|标题片段|infohash|磁力> --dir DIR [-p] [-o 名字] [--no-verify]
 ```
 
 - 序号支持 `1,3,5` 与 `2-4`，按最近一次 find 的**视图**（过滤+排序后）取。
 - 也可以给标题片段（匹配标题或详情页 URL 子串）、infohash（32/40 位，缓存里有现成磁力就用，没有就自己拼）或完整磁力。
-- **默认先做真做种校验**：bt-metadata-only 从 DHT 拉真实元数据（`A2_TOR_VERIFY_TIMEOUT` 秒，默认 90），校验通过才入库；拉不到说明真没人做种（源的 seeds 数会撒谎），换一条或用 `--no-verify` 强下。
-- 校验产物落 `~/.aria2/tor-cache`（绝不能落 `.incoming`，会触发入库钩子）。
-- **落库分类**：没显式给 `-m/-t/-P/-d` 时跟随那一行的分类（源的分类，或按标题推断的分类），
-  所以整季包不会因为磁力里的 `dn=` 被简写而落进普通下载目录；校验拿到的真实种子名优先用于分类。
+- **默认先做真做种校验**：bt-metadata-only 从 DHT 拉真实元数据（`A2_TOR_VERIFY_TIMEOUT` 秒，默认 90），校验通过才下到 `--dir`；拉不到说明真没人做种（源的 seeds 数会撒谎），换一条或用 `--no-verify` 强下。
+- 校验产物落 `~/.aria2/tor-cache`（别指向你的媒体库目录，免得半成品混进去）。
+- **落点**：`--dir` 必填，与其他 `add` 一致；要按分类落子目录，由技能看那一行的 `cat`（源的分类或标题推断）
+  拼出目录后传进来。校验拿到的真实种子名只用于显示，不参与 a2 的任何判断。
 
 ## 4. 任务查看
 
@@ -98,27 +111,20 @@ a2 up 1M     # 上传限速
 a2 down 0    # 0 = 不限速
 ```
 
-## 7. `a2 sweep` — 手动收尾入库
-
-把 `.incoming` 里 aria2 认定「数据完整」、但钩子没搬走的条目，经 ffprobe 校验后搬进媒体库（用 `nameclean` 清洗文件名），并清理残留 `.aria2` 控制文件与 BT 元数据文件。
-- 完成判据**只信 RPC**（completedLength==totalLength），不看 `.aria2` 控制文件（conf 里 force-save=true 会让已完成任务的控制文件永久残留）。
-- RPC 不可用时降级为离线模式（只做 ffprobe 守卫，并明确警告）。
-- 已存在同名目标会追加时间戳后缀，不覆盖。
-
-## 8. AList 网盘助手（`a2-ls` / `a2-alist` / `a2-alist-dir` / `a2-aliyun`）
+## 7. AList 网盘助手（`a2-ls` / `a2-alist` / `a2-alist-dir` / `a2-aliyun`）
 
 前置：AList 服务在 `http://localhost:5244`；管理员密码读 `~/.alist/admin_password.txt`（没有则交互输入）；已挂载阿里云盘（AliyundriveOpen 驱动）。
 
 | 命令 | 作用 |
 |---|---|
 | `a2-ls [路径]` | 列出目录/文件（默认 `/`），目录在前、文件带大小 |
-| `a2-alist "路径" [输出目录]` | 单文件：AList 取直链 → `a2 add -d 输出目录` |
-| `a2-alist-dir "目录" [输出目录] [过滤]` | 目录批量：逐个取直链加入 a2（默认输出 `${A2_DOWNLOAD_DIR:-~/Downloads}`，过滤如 `*.mkv`） |
+| `a2-alist "路径" [输出目录]` | 单文件：AList 取直链 → `a2 add --dir 输出目录`（默认 `a2-dest`） |
+| `a2-alist-dir "目录" [输出目录] [过滤]` | 目录批量：逐个取直链加入 a2（默认 `a2-dest`，过滤如 `*.mkv`） |
 | `a2-aliyun "路径" [输出目录]` | 阿里云盘文件直链下载（密码同样读密码文件，不写死在脚本里） |
 
 AList 本身的安装/阿里云盘接入见本技能 `references/install-guide.md`（安装）、`references/aliyun-driver.md`（阿里云盘驱动）、`references/alist-api.md`（API），脚本为 `scripts/install-alist.sh` 与 `scripts/setup-aliyun.sh`。
 
-## 9. 环境变量（可覆盖默认行为）
+## 8. 环境变量（可覆盖默认行为）
 
 | 变量 | 默认 | 作用 |
 |---|---|---|
@@ -126,7 +132,7 @@ AList 本身的安装/阿里云盘接入见本技能 `references/install-guide.m
 | `A2_TOR_TIMEOUT` | 60 | 单次调用源命令的超时（秒） |
 | `A2_TOR_CACHE_TTL` | 900 | find 缓存有效期（秒） |
 | `A2_TOR_VERIFY_TIMEOUT` | 90 | grab 元数据校验超时（秒） |
-| `A2_TOR_CACHE_DIR` | ~/.aria2/tor-cache | 元数据校验产物目录（**不能**指向 .incoming） |
+| `A2_TOR_CACHE_DIR` | ~/.aria2/tor-cache | 元数据校验产物目录（别指向媒体库目录） |
 | `A2_TOR_DEBUG` | 空 | 1=打印完整源命令与源 stderr（命令可能含 token，谨慎） |
 | `A2_FIND_CACHE` | ~/.aria2/find-cache.json | 搜索缓存文件（测试/多实例） |
 | `A2_RC` | ~/.aria2/a2.conf | a2 自己的配置文件 |
@@ -134,17 +140,18 @@ AList 本身的安装/阿里云盘接入见本技能 `references/install-guide.m
 | `A2_SERVICE` | a2.conf 的 `service=` | 服务名（launchd / systemd unit / Windows 计划任务；只影响提示信息） |
 | `A2_SECRET` | conf 的 `rpc-secret` | RPC 密钥覆盖 |
 | `A2_MIN_FREE_GB` | 20 | 目标盘最小剩余空间阈值 |
-| `A2_MEDIA_ROOT` | ~/media | 媒体库根目录（含 Movies/TV/Private；可在任意盘，Windows 可写 `D:\\media`） |
-| `A2_DOWNLOAD_DIR` | ~/Downloads | 普通文件与 AList 直链的默认下载目录 |
+| `A2_DEST_CONF` | ~/.aria2/dest.conf | 落点配置文件（`a2-dest` 与启动器读；a2 不读） |
+| `A2_MEDIA_ROOT` | `a2-dest media` | **仅 AList 助手脚本**的临时覆盖；常驻值请用 `a2-dest media set` |
+| `A2_DOWNLOAD_DIR` | `a2-dest` | **仅 AList 助手脚本**的临时覆盖；常驻值请用 `a2-dest set` |
 | `A2_ARIA2` | `command -v aria2c` | aria2c 可执行文件路径（服务管理器 PATH 里找不到时指定绝对路径） |
 | `A2_ALLOW_CREATE` | 空 | 1=允许把目标目录创建在系统盘上（默认拒绝，防止外接盘没挂载时误写） |
-| `A2_FALLBACK_DIR` | 空 | 媒体库不可用时临时回退的下载目录（不设则拒绝启动） |
+| `A2_FALLBACK_DIR` | 空 | 落点目录不可用时临时回退的下载目录（不设则拒绝启动） |
 
-## 10. 与裸 RPC 的分工（a2 不覆盖才走 RPC）
+## 9. 与裸 RPC 的分工（a2 不覆盖才走 RPC）
 
 a2 是"常用操作的封装"，以下能力它没暴露，需要 `scripts/aria2_cli.py` 或直接 curl（端口取 conf 的 `rpc-listen-port`）：
 - `select-file`：整季包只下指定集（见 SKILL.md §5.3 完整示例）；
-- `bt-metadata-only` + `bt-save-metadata`：定制元数据预校验；
+- `bt-metadata-only` + `bt-save-metadata`：定制元数据预校验（`a2 grab` 已内置一版）；
 - `aria2.addTorrent` 传自定义 options；
 - `aria2.changeGlobalOption`：限速之外的全局选项；
 - 按需字段的 `tellStatus` / `getGlobalStat` / `getFiles`。

@@ -10,7 +10,7 @@
 | aria2c | 下载引擎 | `brew install aria2` | `sudo apt install aria2` | `sudo dnf install aria2` / `sudo pacman -S aria2` | `winget install aria2.aria2` / `scoop install aria2` |
 | python3 | a2 / 钩子 / 清洗 / 搜索源脚本 | `brew install python3`（系统自带也可） | `sudo apt install python3` | `sudo dnf install python3` | WSL 自带；原生用 python.org 安装包 |
 | curl | AList 助手、RPC 探活 | 系统自带 | `sudo apt install curl` | `sudo dnf install curl` | 系统自带（Win10+） |
-| ffprobe (ffmpeg) | 入库前完整性校验（强烈建议） | `brew install ffmpeg` | `sudo apt install ffmpeg` | `sudo dnf install ffmpeg` | `winget install ffmpeg` / `scoop install ffmpeg` |
+| ffprobe (ffmpeg) | 可选：自己校验文件完整性（a2 不再调用） | `brew install ffmpeg` | `sudo apt install ffmpeg` | `sudo dnf install ffmpeg` | `winget install ffmpeg` / `scoop install ffmpeg` |
 | AList + 云盘 | 网盘直链下载（可选） | 见 §5 | 同 | 同 | 同 |
 
 搜索源不需要额外依赖：源是你自己的脚本/命令，见 `references/tor-source.md`。
@@ -25,11 +25,10 @@ A2_SERVICE=a2.你的名字 bash scripts/install-a2.sh
 
 脚本幂等，重复运行安全，**绝不覆盖**已有 `aria2.conf`、`a2.conf` 与服务定义。做的事：
 
-1. 依赖检查（aria2c/python3/curl；ffprobe 缺失仅警告），缺失时按平台给安装命令；
-2. 建 `~/.aria2`，touch 空 `aria2.session` / `aria2.log` / `move.log` / `move.lock`（session 文件不存在 aria2 会直接退出）；
-3. 建媒体库目录 `$A2_MEDIA_ROOT/{Movies,TV,Private,.incoming/…}` —— 但如果该路径会被创建到系统盘上
-   （外接盘/网络盘没挂载时的典型表现）就跳过并提示，避免误在系统盘上铺一套目录；
-4. 安装核心脚本：`a2`、`nameclean.py`、`on-complete.py`、`start-aria2.sh` → `~/.aria2/`；
+1. 依赖检查（aria2c/python3/curl），缺失时按平台给安装命令；
+2. 建 `~/.aria2`，touch 空 `aria2.session` / `aria2.log`（session 文件不存在 aria2 会直接退出）；
+3. 安装核心脚本：`a2`、`start-aria2.sh` → `~/.aria2/`，`a2-dest` → `~/.local/bin`；
+4. 首次运行 `a2-dest`：按当前 OS 生成默认下载目录并写入 `~/.aria2/dest.conf`（已存在则沿用，不覆盖用户改过的值）；
 5. `~/.local/bin/a2` 软链到 `~/.aria2/a2`；AList 四件套复制到 `~/.local/bin`（不在 PATH 会给出提示）；
 6. 搜索源脚本 `tor-source-demo.py` / `tor-source-template.py` → `~/.aria2/`；
 7. 无 `aria2.conf` 时用模板生成（随机 `rpc-secret`，`__HOME__` 替换成实际家目录），并 `chmod 600`；
@@ -43,8 +42,10 @@ A2_SERVICE=a2.你的名字 bash scripts/install-a2.sh
 ```bash
 # 三平台通用部分
 mkdir -p ~/.aria2 ~/.local/bin
-touch ~/.aria2/aria2.session ~/.aria2/aria2.log ~/.aria2/move.log ~/.aria2/move.lock
-cp scripts/a2 scripts/nameclean.py scripts/on-complete.py scripts/start-aria2.sh ~/.aria2/
+touch ~/.aria2/aria2.session ~/.aria2/aria2.log
+cp scripts/a2 scripts/start-aria2.sh ~/.aria2/
+cp scripts/a2-dest ~/.local/bin/ && chmod 755 ~/.local/bin/a2-dest
+a2-dest >/dev/null            # 首次运行：按 OS 生成默认下载目录并持久化
 cp scripts/tor-source-demo.py scripts/tor-source-template.py ~/.aria2/
 ln -sf ~/.aria2/a2 ~/.local/bin/a2
 # aria2.conf：assets/aria2.conf.template → ~/.aria2/aria2.conf，替换 __HOME__ 与 __RPC_SECRET__，然后 chmod 600
@@ -76,16 +77,18 @@ loginctl enable-linger "$USER"        # 可选：没登录也让它常驻
 两个配置文件的分工：**aria2.conf** 只放 aria2 认识的键（端口、密钥、目录、BT 参数）；
 **a2.conf** 放 a2 专有配置（搜索源、服务名）——写进 aria2.conf 只会换来每次启动的 `[WARN] Unknown option` 刷屏。
 
-## 4. 媒体落点与空间保护
+## 4. 落点与空间保护
+
+落点是**显式**的：`a2 add --dir DIR` / `a2 grab … --dir DIR`，a2 不改名、不搬动、不建暂存区。
 
 ```
-${A2_MEDIA_ROOT}/{Movies,TV,Private}                        # 媒体库根（默认 ~/media）
-${A2_MEDIA_ROOT}/.incoming/{Movies,TV,Private,_unsorted}    # 下载中的暂存区（隐藏目录）
-aria2.conf 的 dir（默认 ~/Downloads）                        # 普通文件（zip/pdf/…）与 -flat 的落点
+a2-dest            # 默认下载目录（首次按 OS 生成：macOS ~/Downloads、Linux XDG、Windows %USERPROFILE%\Downloads）
+a2-dest set DIR    # 改默认（持久化到 ~/.aria2/dest.conf）
+a2-dest media      # 媒体库根（未设置 = 默认下载目录）
 ```
 
-- `a2 add` 按名字把任务路由进暂存子目录，完成后 `on-complete.py` 搬进对应库目录并清名；
-- 媒体库可以放在**任何**盘上：内置盘、外接盘、网络盘、Windows 的 `D:\media`、Linux 的 `/mnt/xxx/media` 都行；
+- 「电影 / 剧集 / 私藏」这类子目录由**技能**拼：`$(a2-dest media)/Movies`、`/TV`、`/Private`（需要就 `mkdir -p`）；
+- 落点可以放在**任何**盘上：内置盘、外接盘、网络盘、Windows 的 `D:\media`、Linux 的 `/mnt/xxx/media` 都行；
 - 启动器与 `a2 add` 会用同一条跨平台判据检查目标目录：**家目录内**、**落在别的盘上**都放行；
   只有「既不在家目录内、又会落在系统盘上」才拒绝（外接盘/网络盘没挂载时挂载点目录会凭空消失）。
   确认就要那个位置：先 `mkdir -p`，或设 `A2_ALLOW_CREATE=1`；
@@ -119,8 +122,8 @@ tor-source-cmd=python3 ~/.aria2/tor-source-demo.py      # 离线自测（不联�
 
 服务名默认 `com.example.aria2`（安装时用 `A2_SERVICE` 换）。三平台的共同要点：
 
-- **必须走 `start-aria2.sh`**：它校验媒体库目录是否可用（不存在且会被建到系统盘上就拒绝启动），
-  媒体库根与默认下载目录分别由 `A2_MEDIA_ROOT`（默认 `~/media`）与 `A2_DOWNLOAD_DIR`（默认 `~/Downloads`）配置。
+- **必须走 `start-aria2.sh`**：它校验落点目录是否可用（不存在且会被建到系统盘上就拒绝启动），
+  目录取自 `~/.aria2/dest.conf` 的 `download-dir` / `media-root`（`a2-dest` 维护）。
   终端 / 服务管理器 / cron 都走它，行为才一致。
 - **必须前台运行**（`--daemon=false`）：daemon 化会 fork 后退出，服务管理器会当成崩溃无限重启。
 - 崩溃自动拉起：macOS `KeepAlive=true`（`ThrottleInterval` ≥ 10 秒）；Linux `Restart=always` + `RestartSec=10`；
@@ -144,7 +147,7 @@ schtasks /End /TN "<服务名>" && schtasks /Run /TN "<服务名>"   # 重启
 ```
 
 日志：macOS `~/.aria2/launchd.out.log` / `launchd.err.log`；Linux `journalctl --user -u <服务名>`；
-三平台都有 `~/.aria2/aria2.log` 与 `~/.aria2/move.log`。
+三平台都有 `~/.aria2/aria2.log`。
 重启守护后头几分钟 RPC 可能时断时续（进程在重新校验/保存大任务）——**别反复 kill**，见 `references/troubleshooting.md` §2。
 
 ## 8. 维护要点
@@ -159,12 +162,12 @@ schtasks /End /TN "<服务名>" && schtasks /Run /TN "<服务名>"   # 重启
 
 ## 9. 故障排查
 
-完整表（路径、服务管理、fsync 假死、日志、BT、入库、RPC 各主题）见 **`references/troubleshooting.md`**。
+完整表（路径、服务管理、fsync 假死、日志、BT、落点、RPC 各主题）见 **`references/troubleshooting.md`**。
 先记这四条：
 
 | 现象 | 处理 |
 |---|---|
 | `a2` 报 RPC 不可用 | 确认守护在跑（macOS `launchctl print gui/$(id -u)/<服务名>`；Linux `systemctl --user status <服务名>`；Windows `schtasks /Query /TN "<服务名>" /V`），再核对 conf 的 `rpc-listen-port` |
-| 加任务被拒：媒体库/目标目录不可用 | 外接盘/网络盘没挂载；挂载后重试，或 `A2_ALLOW_CREATE=1`（确实要放系统盘时） |
+| 加任务被拒：目标目录不可用 | 外接盘/网络盘没挂载；挂载后重试，或 `A2_ALLOW_CREATE=1`（确实要放系统盘时） |
 | 加任务被拒：目标盘剩余不足 | `A2_MIN_FREE_GB=5 a2 add …` 临时放宽，或清理磁盘 |
-| `.incoming` 里文件不入库 | 完成判据是 RPC 不是控制文件；`a2 sweep` 手动收尾；看 `~/.aria2/move.log` |
+| `a2 add` 报「缺少目标目录」 | a2 不推断落点：`a2 add --dir "$(a2-dest)" …`；换默认值用 `a2-dest set <目录>` |

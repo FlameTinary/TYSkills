@@ -170,7 +170,7 @@ GET /api/admin/task/offline_download/undone
 3. 用 a2 添加下载：
 
 ```bash
-a2 add "<raw_url>"
+a2 add --dir "$(a2-dest)" "<raw_url>"
 ```
 
 ### 示例脚本
