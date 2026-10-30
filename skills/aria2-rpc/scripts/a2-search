@@ -1,0 +1,540 @@
+#!/usr/bin/env python3
+"""a2-search —— 资源搜索（skill 层：a2 只负责下载，搜索在这里）
+
+搜索分两条腿：
+  ① **配置站点**：`~/.aria2/search-sites.conf` 里的 `site=` 行 —— 你填站点搜索页或自有 API，
+     脚本直接抓结果页并抽出 magnet 链接（HTML 模式），或调用你写的命令拿 JSON 行（`cmd:` 模式）；
+  ② **全网发现**：同一文件的 `websearch=` 行 —— 一个通用搜索页，用来发现"还有哪些页面/站点有资源"，
+     输出一批结果页链接，交给 agent 的浏览能力继续看（也可以 `a2-search --discover "<词>" --json` 拿结构化数据）。
+
+本脚本不内置任何资源站：站点全部由使用者配置；`websearch=` 默认给的是通用搜索引擎的 HTML 端点。
+
+配置（`~/.aria2/search-sites.conf`，`A2_SITES_CONF` 可换路径；首次运行会自动生成模板）：
+
+    site=<名字>|<URL 模板>        # HTML 搜索结果页，自动抽 magnet 链接
+    site=<名字>|cmd:<命令>        # 自写命令，输出 JSON 行（契约见 references/search-sites.md）
+    websearch=<URL 模板>          # 全网发现用（可选）
+
+  模板占位符：`{query}` = URL 编码后的关键词，`{page}` = 页码（从 1 起）。
+  cmd 模式另有环境变量：`A2_QUERY` / `A2_PAGE` / `A2_PAGES`。
+
+用法:
+  a2-search <关键词> [--pages N] [--min-seeds N] [--res 1080p] [--prefer 组A,组B] [--all]
+                     [--json] [--site 名字] [--timeout S]
+  a2-search --discover <关键词> [--json]      # 只做全网发现，列出结果页链接
+  a2-search sites                            # 列出已配置的站点/搜索源
+  a2-search --json <关键词>                   # 机器可读（含完整磁力，直接喂 a2 add --dir）
+"""
+import hashlib
+import html as htmllib
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+CONF = os.path.expanduser(os.environ.get("A2_SITES_CONF", "~/.aria2/search-sites.conf"))
+TIMEOUT = float(os.environ.get("A2_SEARCH_TIMEOUT", "20"))
+UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+
+CONF_TEMPLATE = """# a2-search 的站点配置（A2_SITES_CONF 可换路径）
+# 模板占位符：{query} = URL 编码后的关键词，{page} = 页码（从 1 起）
+#
+# 形式 1：HTML 搜索结果页（自动抽 magnet 链接）
+#   site=<名字>|<URL 模板>
+#   例：site=某站|https://example.org/search?q={query}&page={page}
+#
+# 形式 2：你自己的命令，输出 JSON 行（契约见 references/search-sites.md）
+#   site=<名字>|cmd:<命令>
+#   例：site=本地|cmd:python3 ~/.aria2/search-source-demo.py
+#
+# 全网发现（可选）：一个通用搜索页，用来找"还有哪些页面有资源"
+# websearch=https://www.bing.com/search?q={query}
+
+websearch=https://www.bing.com/search?q={query}
+"""
+
+MAGNET_RE = re.compile(r"magnet:\?[^\s\"'<>]+")
+SIZE_RE = re.compile(r"(?i)\b(\d+(?:[.,]\d+)?)\s*(GB|GiB|MB|MiB|TB|TiB)\b")
+TEXT_AFTER_RE = re.compile(r">([^<>]{2,300})<")
+TAG_RE = re.compile(r"(?s)<[^>]*>")
+HREF_RE = re.compile(r"""(?is)<a\b[^>]*href=["']([^"']+)["'][^>]*>(.*?)</a>""")
+SEEDS_RE = re.compile(r"(?i)(?:seeders?|seeds?|种子|\bse\b)\s*[:：]?\s*(\d{1,6})")
+
+VIDEO_EXT = (".mkv", ".mp4", ".avi", ".ts", ".m2ts", ".mov", ".wmv", ".flv",
+             ".rmvb", ".mpg", ".m4v")
+TV_RE = re.compile(r"(?i)(s\d{1,2}[\s._-]*e\d{1,3}|(?<!\d)\d{1,2}x\d{2}(?!\d)|"
+                   r"第\s?[\d一二三四五六七八九十]{1,3}\s?[-~—至]?\s?[\d一二三四五六七八九十]{0,3}\s?[集話话期季]|"
+                   r"[全共]\s?[\d一二三四五六七八九十]{0,4}\s?[集季]|合集|season[\s._-]?\d|"
+                   r"\bep\s?\d{1,3}\b|"
+                   r"s\d{1,2}(?!\d)(?![\s._-]*e\d{1,2}))")
+QUALITY_RE = re.compile(r"(?i)(\b(19|20)\d{2}\b|1080p|2160p|720p|480p|\b4k\b|blu-?ray|"
+                        r"web-?dl|webrip|hdtv|remux|hdr|dvdrip|bdrip)")
+SEASON_RE = re.compile(r"(?i)(complete|全集|season[\s._-]*\d|seasons[\s._-]*\d|"
+                       r"s\d{1,2}(?!\d)(?![\s._-]*e\d{1,2})|"
+                       r"s\d{2}[\s._-]*[-~][\s._-]*s?\d{2})")
+EPISODE_RE = re.compile(r"(?i)s\d{2}[\s._-]?e\d{2}")
+NOISE = ("3d", "sbs", "hindi", "dual audio", "flac", "e-book", "companion", "audiobook")
+SENSITIVE_RE = re.compile(r"(?i)(://|(^|[\s=])(-{1,2}(api[-_]?key|key|token|secret|password|pass|auth|sig|signature)\b)"
+                          r"|[A-Za-z0-9_\-]{24,})")
+STATS = {"fetched": 0, "dropped": 0, "pages": 0}
+
+
+# ---------------------------------------------------------------- 配置
+
+def load_conf(create=True):
+    """返回 ({name: target}, websearch)。文件不存在时按模板生成一份（不内置任何资源站）。"""
+    created = False
+    if not os.path.exists(CONF):
+        if not create:
+            return {}, ""
+        d = os.path.dirname(CONF)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        with open(CONF, "w") as fh:
+            fh.write(CONF_TEMPLATE)
+        created = True
+    sites, websearch = {}, ""
+    with open(CONF) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            key, val = key.strip(), val.strip()
+            if key == "site" and "|" in val:
+                name, target = val.split("|", 1)
+                if name.strip() and target.strip():
+                    sites[name.strip()] = target.strip()
+            elif key == "websearch":
+                websearch = val
+    if created:
+        sys.stderr.write("已生成站点配置 %s（填 site= 行之后就有站点可搜；参考 references/search-sites.md）\n" % CONF)
+    return sites, websearch
+
+
+def cmd_label(cmd):
+    """命令里可能带 token/URL：给用户看时只露第一个词 + 指纹。"""
+    first = (cmd.split() or [cmd])[0]
+    if os.environ.get("A2_SEARCH_DEBUG") or not SENSITIVE_RE.search(cmd):
+        return cmd
+    return "%s …（指纹 %s；A2_SEARCH_DEBUG=1 可打印完整命令）" % (
+        first, hashlib.sha1(cmd.encode("utf-8")).hexdigest()[:8])
+
+
+SIZE_UNITS = {"GB": "GB", "GIB": "GB", "MB": "MB", "MIB": "MB", "TB": "TB", "TIB": "TB"}
+
+
+def fill(template, query, page):
+    q = urllib.parse.quote_plus(query)
+    if "{query}" in template or "{page}" in template:
+        return template.replace("{query}", q).replace("{page}", str(page))
+    if template.startswith("file:"):                       # 本地夹具：不要往 URL 尾巴上挂查询串
+        return template
+    sep = "&" if "?" in template else "?"
+    return "%s%s%s" % (template, sep, q)
+
+
+# ---------------------------------------------------------------- 抓取
+
+def fetch(url, timeout=None):
+    req = urllib.request.Request(url, headers={"User-Agent": UA,
+                                               "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"})
+    proxy = os.environ.get("A2_SEARCH_PROXY")
+    if proxy:
+        handler = urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+        opener = urllib.request.build_opener(handler)
+    else:
+        opener = urllib.request.build_opener()
+    try:
+        with opener.open(req, timeout=timeout or TIMEOUT) as resp:
+            raw = resp.read()
+            charset = resp.headers.get_content_charset() or "utf-8"
+    except urllib.error.HTTPError as exc:
+        sys.exit("抓取失败（HTTP %s）：%s" % (exc.code, url))
+    except Exception as exc:                              # noqa: BLE001
+        sys.exit("抓取失败（%s）：%s\n  提示：需要代理就设 A2_SEARCH_PROXY=http://127.0.0.1:7897"
+                 % (exc, url))
+    try:
+        return raw.decode(charset, "replace")
+    except LookupError:
+        return raw.decode("utf-8", "replace")
+
+
+# ---------------------------------------------------------------- 解析
+
+def clean_text(t):
+    t = htmllib.unescape(TAG_RE.sub(" ", t or ""))
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _title_around(text, pos, end):
+    """磁力链接附近的可见文字：优先「同一 <a> 里的标签」，其次前一个文字块。"""
+    after = text[end:end + 400]
+    m = TEXT_AFTER_RE.search(after)
+    if m and m.group(1).strip():
+        return clean_text(m.group(1))
+    chunk = text[max(0, pos - 800):pos]
+    cands = [c for c in TEXT_AFTER_RE.findall(chunk) if c.strip()]
+    return clean_text(cands[-1]) if cands else ""
+
+
+def _row_window(text, pos, end):
+    """这一条自己的文字窗口：从本条磁力往后到下一个磁力/行尾，再补上前一段同行文字。
+    不做「往前 400 字」的模糊搜索——那会把上一条的体积算到这一条头上。"""
+    nxt = MAGNET_RE.search(text, end)
+    head = text[end:nxt.start() if nxt else end + 600]
+    prev = None
+    if pos > 0:
+        marks = [text.rfind(sep, 0, pos) for sep in ("<tr", "<TR", "<li", "<LI")]
+        prev = max(marks)
+    tail = text[(prev + 1) if prev and prev > 0 else max(0, pos - 300):pos]
+    return tail + head
+
+
+def _size_around(text, pos, end):
+    win = _row_window(text, pos, end)
+    m = SIZE_RE.search(win)
+    if not m:
+        return "-"
+    num = m.group(1).replace(",", ".")
+    return "%s %s" % (num, SIZE_UNITS.get(m.group(2).upper(), m.group(2).upper()))
+
+
+def _seeds_around(text, pos, end):
+    m = SEEDS_RE.search(clean_text(_row_window(text, pos, end)))
+    return int(m.group(1)) if m else None
+
+
+def ih_of(magnet):
+    m = re.search(r"btih:([0-9a-fA-F]{32,40})", magnet or "")
+    return m.group(1).lower() if m else ""
+
+
+def cat_of(title, raw_cat=None):
+    """分类归一：源给了就按源的；没给就按标题猜（与默认过滤同一套正则）。"""
+    c = (raw_cat or "").strip().lower()
+    if c.startswith("movie"):
+        return "Movies"
+    if c.startswith("tv"):
+        return "TV"
+    if re.search(r"\b(tv|series|season|episode)\b", c):
+        return "TV"
+    if re.search(r"\b(movie|film)\b", c):
+        return "Movies"
+    if c and c not in ("other", "unknown", "none", "null"):
+        return str(raw_cat).strip()
+    if TV_RE.search(title) or SEASON_RE.search(title):
+        return "TV"
+    if QUALITY_RE.search(title) or title.lower().endswith(VIDEO_EXT):
+        return "Movies"
+    return "Other"
+
+
+def parse_html(text, src):
+    """HTML 结果页 → 行。只认 magnet 链接，标题取链接标签（其次最近的文字块）。"""
+    rows = []
+    for m in MAGNET_RE.finditer(text):
+        mag = htmllib.unescape(m.group(0))
+        ih = ih_of(mag)
+        title = _title_around(text, m.start(), m.end())
+        if not (ih or mag):
+            continue
+        if not title:
+            title = "(无标题) " + (ih[:8] if ih else "")
+        rows.append({"title": title, "magnet": mag, "ih": ih,
+                     "size": _size_around(text, m.start(), m.end()),
+                     "seeds": _seeds_around(text, m.start(), m.end()),
+                     "leech": None, "cat": cat_of(title),
+                     "page": "", "src": src})
+    return rows
+
+
+def norm_row(r, src):
+    """cmd 源的一行 → 统一行；认不出来（无标题，或既无磁力又无 infohash）返回 None。"""
+    def g(*keys):
+        for k in keys:
+            v = r.get(k)
+            if v not in (None, "", []):
+                return v
+        return None
+
+    title = re.sub(r"\s+", " ", str(g("title", "name") or "")).strip()
+    mag = str(g("magnet", "magnet_uri", "magnet_link") or "").strip()
+    ih = str(g("info_hash", "infohash", "ih", "hash") or "").strip().lower()
+    if mag and not ih:
+        ih = ih_of(mag)
+    if not title or not (mag or ih):
+        return None
+    if not mag:
+        trk = g("trackers", "tr") or []
+        if isinstance(trk, str):
+            trk = [x for x in re.split(r"[,\s]+", trk) if x]
+        mag = "magnet:?xt=urn:btih:" + ih + ("&dn=" + urllib.parse.quote_plus(title))
+        for t in (trk if isinstance(trk, (list, tuple)) else ()):
+            mag += "&tr=" + urllib.parse.quote_plus(str(t))
+    size = g("size_bytes", "bytes", "length", "size_b")
+    if size is not None:
+        size = human_size(int(float(size)))
+    else:
+        s = g("size", "size_str")
+        if isinstance(s, (int, float)):
+            size = human_size(s)
+        elif s:
+            size = str(s).strip()
+        elif g("size_gb") is not None:
+            size = human_size(float(g("size_gb")) * 1e9)
+        else:
+            size = "-"
+    seeds = g("seeders", "seeds", "s")
+    return {"title": title, "magnet": mag, "ih": ih, "size": size,
+            "seeds": to_int(seeds) if seeds is not None else None,
+            "leech": to_int(g("leechers", "leech", "l")),
+            "cat": cat_of(title, g("category", "cat")),
+            "page": str(g("url", "detail", "link", "page") or ""),
+            "src": str(g("source", "src", "site", "indexer") or src)}
+
+
+def human_size(n):
+    n = float(n or 0)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return ("%.0f %s" % (n, unit)) if unit in ("B", "KB") else ("%.1f %s" % (n, unit))
+        n /= 1024
+
+
+def to_int(v, default=0):
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return default
+
+
+# ---------------------------------------------------------------- 数据源
+
+def run_cmd_source(cmd, query, page, pages):
+    """cmd: 源 —— 命令把 JSON 打到 stdout；失败如实报错，绝不当成「0 条」。"""
+    c = cmd
+    q = urllib.parse.quote_plus(query)
+    if "{query}" in c or "{page}" in c:
+        c = c.replace("{query}", q).replace("{page}", str(page))
+    else:
+        c = "%s %s" % (c, q)
+    env = dict(os.environ, A2_QUERY=query, A2_PAGE=str(page), A2_PAGES=str(pages))
+    try:
+        proc = subprocess.run(c, shell=True, capture_output=True, text=True,
+                              timeout=TIMEOUT * 3, env=env)
+    except subprocess.TimeoutExpired:
+        sys.exit("搜索源超时（%.0fs）：%s" % (TIMEOUT * 3, cmd_label(cmd)))
+    except OSError as exc:                                # noqa: BLE001
+        sys.exit("搜索源起不来：%s\n  命令：%s" % (exc, cmd_label(cmd)))
+    out, err = (proc.stdout or "").strip(), (proc.stderr or "").strip()
+    if proc.returncode != 0:
+        sys.exit("搜索源失败（exit %d）：%s%s" % (proc.returncode, cmd_label(cmd),
+                 ("\n  源报错：%s" % err[-500:]) if err else ""))
+    if not out:
+        sys.exit("搜索源没有输出（exit 0 但 stdout 为空）：%s%s" % (cmd_label(cmd),
+                 ("\n  源 stderr：%s" % err[-500:]) if err else ""))
+    try:
+        data = json.loads(out)
+    except ValueError as exc:
+        sys.exit("搜索源输出不是 JSON（%s）。\n  前 200 字节：%s\n"
+                 "  规则：stdout 只打 JSON，日志走 stderr。" % (exc, out[:200]))
+    if isinstance(data, dict):
+        data = data.get("rows") or data.get("results") or data.get("data") or []
+    if not isinstance(data, list):
+        sys.exit("搜索源返回的 JSON 既不是数组也不是 {\"rows\": [...]}")
+    return [r for r in data if isinstance(r, dict)]
+
+
+def collect_sites(sites, query, pages, only=None):
+    """按站点抓取并按 infohash 去重；返回 (rows, per_site_stats)。"""
+    rows, seen, per = [], set(), {}
+    selected = [(n, t) for n, t in sites.items() if not only or n == only]
+    if only and not selected:
+        sys.exit("没有叫 %r 的站点（已配置：%s）" % (only, "、".join(sites) or "无"))
+    for name, target in selected:
+        got = 0
+        for page in range(1, max(1, pages) + 1):
+            STATS["pages"] += 1
+            if target.startswith("cmd:"):
+                raw = run_cmd_source(target[4:].strip(), query, page, pages)
+                batch = [r for r in (norm_row(x, name) for x in raw) if r]
+            else:
+                text = fetch(fill(target, query, page))
+                batch = parse_html(text, name)
+            STATS["fetched"] += len(batch)
+            fresh = 0
+            for r in batch:
+                key = r["ih"] or r["title"].lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                rows.append(r)
+                fresh += 1
+            got += fresh
+            if pages > 1 and fresh == 0:
+                break                                  # 该站不支持翻页 / 已到底
+        per[name] = got
+    return rows, per
+
+
+def filter_rows(rows, min_seeds=1, res=None, prefer=(), keep_all=False):
+    """默认过滤：电影分类直接留；剧集要「整季/全集」且不是单集；Other 默认不要。
+    seeds 未知（HTML 页常见）的行不参与 --min-seeds 判断。"""
+    def keep(r):
+        t, cat = r["title"].lower(), r["cat"].lower()
+        if any(k in t or k in cat for k in NOISE):
+            return False
+        if res and res.lower() not in t:
+            return False
+        if r.get("seeds") is not None and r["seeds"] < min_seeds:
+            return False
+        if keep_all:
+            return True
+        if cat.startswith("movies"):
+            return True
+        if not cat.startswith("tv"):
+            return False
+        return bool(SEASON_RE.search(r["title"])) and not EPISODE_RE.search(r["title"])
+
+    grp = [g.lower() for g in prefer]
+
+    def rank(r):
+        t = r["title"].lower()
+        return (0 if any(g in t for g in grp) else 1, -(r.get("seeds") if r.get("seeds") is not None else -1))
+    return sorted([r for r in rows if keep(r)], key=rank)
+
+
+def discover(websearch, query, as_json):
+    """全网发现：抓通用搜索页，列出结果页链接（标题 + URL）。"""
+    if not websearch:
+        sys.exit("没有配置 websearch=（全网发现需要一个通用搜索页模板）。\n"
+                 "  在 %s 里加一行：websearch=https://你的搜索页/?q={query}" % CONF)
+    text = fetch(fill(websearch, query, 1))
+    out, seen = [], set()
+    for href, label in HREF_RE.findall(text):
+        href = htmllib.unescape(href).strip()
+        if "uddg=" in href:                                # 搜索页的跳转链接：取出真实 URL
+            m = re.search(r"[?&]uddg=([^&]+)", href)
+            if m:
+                href = urllib.parse.unquote(m.group(1))
+        if not href.startswith("http"):
+            continue
+        if any(k in href for k in ("/settings", "javascript:", "/y.js",
+                                    "bing.com", "microsoft.com", "go.microsoft")):
+            continue
+        title = clean_text(label)
+        if not title or len(title) < 4:
+            continue
+        if href in seen:
+            continue
+        seen.add(href)
+        out.append({"title": title, "url": href})
+    if as_json:
+        print(json.dumps(out, ensure_ascii=False, indent=1))
+        return 0
+    if not out:
+        print("全网发现没有拿到结果页链接（搜索页可能改版/被反爬）。")
+        return 0
+    print("%-3s %s" % ("#", "结果页（标题 → URL）"))
+    for i, r in enumerate(out[:30], 1):
+        print("%-3d %s\n    %s" % (i, r["title"][:100], r["url"]))
+    print("\n共 %d 条。用 agent 的浏览能力打开这些页面找磁力，或把它们配成 site= 行再搜一次。" % len(out))
+    return 0
+
+
+# ---------------------------------------------------------------- 主流程
+
+USAGE = __doc__
+
+
+def main(argv):
+    args = argv[1:]
+    if not args or args[0] in ("-h", "--help", "help"):
+        print(USAGE.strip())
+        return 0 if args else 2
+
+    sites, websearch = load_conf()
+
+    if args[0] == "sites":
+        if not sites:
+            print("还没有配置站点：%s 里加 site=<名字>|<URL 模板> 或 site=<名字>|cmd:<命令>" % CONF)
+        for name, target in sites.items():
+            kind = "命令" if target.startswith("cmd:") else "HTML"
+            shown = cmd_label(target[4:].strip()) if kind == "命令" else target
+            print("%-12s %-4s %s" % (name, kind, shown))
+        if websearch:
+            print("%-12s %-4s %s" % ("(websearch)", "发现", websearch))
+        return 0
+
+    mode_discover = False
+    pages, min_seeds, res, prefer = 1, 1, None, []
+    keep_all = as_json = False
+    only, q = None, []
+    while args:
+        a, args = args[0], args[1:]
+        if a == "--discover":
+            mode_discover = True
+        elif a == "--pages" and args:
+            pages = max(1, to_int(args.pop(0), 1))
+        elif a == "--min-seeds" and args:
+            min_seeds = to_int(args.pop(0), 1)
+        elif a == "--res" and args:
+            res = args.pop(0)
+        elif a == "--prefer" and args:
+            prefer = [x for x in args.pop(0).split(",") if x]
+        elif a == "--site" and args:
+            only = args.pop(0)
+        elif a == "--timeout" and args:
+            global TIMEOUT
+            TIMEOUT = float(args.pop(0))
+        elif a == "--all":
+            keep_all = True
+        elif a == "--json":
+            as_json = True
+        else:
+            q.append(a)
+    if not q:
+        sys.exit("用法: a2-search <关键词> [--pages N] [--min-seeds N] [--res 1080p] "
+                 "[--prefer 组A,组B] [--all] [--json] [--site 名字] [--timeout S]")
+    query = " ".join(q)
+    if mode_discover:
+        return discover(websearch, query, as_json)
+    if not sites:
+        sys.exit("还没有配置站点：在 %s 里加 site=<名字>|<URL 模板>（HTML 结果页）或 "
+                 'site=<名字>|cmd:<命令>（JSON 行）。\n  契约与示例见 references/search-sites.md；'
+                 '只想要全网发现：a2-search --discover "<关键词>"' % CONF)
+
+    raw, per = collect_sites(sites, query, pages, only)
+    for name, n in per.items():
+        print("（%s：%d 条）" % (name, n), file=sys.stderr)
+    if not raw:
+        print("没有抓到任何磁力链接：关键词 %r。" % query)
+        print("  ① 站点结果页可能改版（HTML 模式只认 magnet 链接）；② 换关键词/多翻页（--pages N）；")
+        print("  ③ 用 a2-search --discover \"%s\" 找别的站点；④ cmd: 源先把命令单独跑一遍看 JSON。" % query)
+        return 0
+    rows = filter_rows(raw, min_seeds, res, prefer, keep_all)
+    if as_json:
+        print(json.dumps(rows, ensure_ascii=False, indent=1))
+        return 0
+    if not rows:
+        print("抓到 %d 条磁力，但没有一条通过默认过滤（电影全留；剧集要整季/全集且不是单集）。\n"
+              "  --all 放宽到全部分类、--min-seeds 0 放宽做种数、--res 去掉分辨率限制。" % len(raw))
+        return 0
+    print("%-3s %-6s %-9s %-8s %-10s %s" % ("#", "种", "体积", "分类", "来源", "标题"))
+    for i, r in enumerate(rows, 1):
+        seeds = "-" if r.get("seeds") is None else str(r["seeds"])
+        print("%-3d %-6s %-9s %-8s %-10s %s" % (i, seeds, r["size"], r["cat"][:8], r["src"][:10], r["title"][:88]))
+    print("\n共 %d 条（原始 %d 条%s）。下载：a2 add --dir <目录> --verify \"<磁力>\"" % (
+        len(rows), len(raw), "，%d 页" % pages if pages > 1 else ""))
+    print("要完整磁力：加 --json（或 a2-search <关键词> --json | 用 jq 取 rows[i].magnet）。")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

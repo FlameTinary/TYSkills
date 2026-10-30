@@ -53,7 +53,8 @@ touch "$ARIA2_DIR/aria2.session" "$ARIA2_DIR/aria2.log"
 install -m 755 "$SKILL_DIR/scripts/a2"             "$ARIA2_DIR/a2"
 install -m 755 "$SKILL_DIR/scripts/start-aria2.sh" "$ARIA2_DIR/start-aria2.sh"
 install -m 755 "$SKILL_DIR/scripts/a2-dest"        "$BIN_DIR/a2-dest"
-echo "已安装核心脚本 -> $ARIA2_DIR/{a2,start-aria2.sh} + $BIN_DIR/a2-dest"
+install -m 755 "$SKILL_DIR/scripts/a2-search"      "$BIN_DIR/a2-search"
+echo "已安装核心脚本 -> $ARIA2_DIR/{a2,start-aria2.sh} + $BIN_DIR/{a2-dest,a2-search}"
 # 落点配置：首次运行按 OS 生成默认下载目录（已存在则沿用，不覆盖用户改过的值）
 "$BIN_DIR/a2-dest" >/dev/null
 echo "默认下载目录 -> $("$BIN_DIR/a2-dest")（改：a2-dest set <目录>）"
@@ -72,10 +73,17 @@ for s in a2-ls a2-alist a2-alist-dir a2-aliyun; do
 done
 echo "已安装 AList 助手 -> $BIN_DIR/{a2-ls,a2-alist,a2-alist-dir,a2-aliyun}"
 
-# ---------- 5) 搜索源脚本（a2 find 的源由你自己配置；这两个不联网也能跑通流程） ----------
-install -m 755 "$SKILL_DIR/scripts/tor-source-demo.py"     "$ARIA2_DIR/tor-source-demo.py"
-install -m 755 "$SKILL_DIR/scripts/tor-source-template.py" "$ARIA2_DIR/tor-source-template.py"
-echo "已安装搜索源脚本 -> $ARIA2_DIR/{tor-source-demo.py,tor-source-template.py}"
+# ---------- 5) 搜索站点配置 + 源骨架（a2-search 用；站点由你自己填） ----------
+install -m 755 "$SKILL_DIR/scripts/search-source-demo.py"     "$ARIA2_DIR/search-source-demo.py"
+install -m 755 "$SKILL_DIR/scripts/search-source-template.py" "$ARIA2_DIR/search-source-template.py"
+echo "已安装搜索源脚本 -> $ARIA2_DIR/{search-source-demo.py,search-source-template.py}"
+if [ -f "$ARIA2_DIR/search-sites.conf" ]; then
+  echo "search-sites.conf 已存在，跳过（站点就配在这里）"
+else
+  sed -e "s|__HOME__|$HOME|g" \
+      "$SKILL_DIR/assets/search-sites.conf.template" > "$ARIA2_DIR/search-sites.conf"
+  echo "已生成 search-sites.conf -> $ARIA2_DIR/search-sites.conf（填 site= 行之后 a2-search 才有站点可搜）"
+fi
 
 # ---------- 6) aria2.conf + a2.conf：不存在才生成（绝不覆盖已有配置） ----------
 if [ -f "$ARIA2_DIR/aria2.conf" ]; then
@@ -157,11 +165,11 @@ cat <<EOF
 == 完成。常用命令：
      a2 st / a2 ls / a2-dest / a2-dest set <目录>
      a2 add --dir "$(${BIN_DIR}/a2-dest)" "<磁力或链接>"      # 落点必须显式给
-   搜索要先配源（a2 不内置任何站点），在 $ARIA2_DIR/a2.conf 里改这一行：
-     tor-source-cmd=<你的搜索源命令>
-   想先跑通流程（离线、不联网）：
-     tor-source-cmd=python3 $ARIA2_DIR/tor-source-demo.py
-   然后 a2 find <关键词> → a2 grab <序号>。契约与示例见 references/tor-source.md。
+   搜索在 skill 层（a2 不内置任何站点）：先在 $ARIA2_DIR/search-sites.conf 里加
+     site=<名字>|<URL 模板>          或   site=<名字>|cmd:<命令>
+   然后 a2-search <关键词> → a2 add --dir <目录> --verify "<磁力>"。
+   想先跑通流程（离线、不联网）：site=本地演示|cmd:python3 $ARIA2_DIR/search-source-demo.py
+   契约与示例见 references/search-sites.md。
    服务名是 ${SERVICE}；想换：A2_SERVICE=a2.其他名字 bash scripts/install-a2.sh
    （服务定义已存在时不会被覆盖，需先删掉旧的再重跑。）
 EOF

@@ -101,11 +101,13 @@ log=__HOME__/.aria2/aria2.log
 # 进度输出间隔(秒)，0=关闭；作为守护进程时看日志即可
 summary-interval=60
 
-## ===================== a2 自己的配置在 ~/.aria2/a2.conf =====================
-# 搜索源（a2 find 用）、服务名这些 **a2 专有** 的配置不要写进本文件：aria2 不认识的键
-# 每次启动都会打 `[WARN] Unknown option: …`（无害但刷屏）。请写 ~/.aria2/a2.conf，
-# 模板见本技能 assets/a2.conf.template（install-a2.sh 会自动装好）。
-# 搜索源的契约与示例：references/tor-source.md
+## ===================== 其他配置放哪里 =====================
+# 本文件只放 **aria2 认识的键**（端口/密钥/目录/BT 参数）。
+#   · a2 / a2-search 的专有配置 → ~/.aria2/a2.conf（目前只有服务名），aria2 不认识的键写这里只会换来
+#     每次启动一行 `[WARN] Unknown option: …`（无害但刷屏）；
+#   · 搜索站点 → ~/.aria2/search-sites.conf（契约 references/search-sites.md）；
+#   · 默认下载目录 / 媒体库根 → ~/.aria2/dest.conf（命令 a2-dest）。
+# 三个文件的模板都在本技能 assets/ 下，install-a2.sh 会自动装好。
 
 ## ===================== 事件钩子（默认不装） =====================
 # a2 不做自动改名/入库：文件就落在 --dir 给的目录里，所以这里不需要 on-download-complete。

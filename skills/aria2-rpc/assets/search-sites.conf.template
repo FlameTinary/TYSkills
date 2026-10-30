@@ -1,0 +1,21 @@
+# =============================================================
+# a2-search 的站点配置（搜索在 skill 层；a2 本身不搜索）
+# 位置：__HOME__/.aria2/search-sites.conf   模板：本技能 assets/search-sites.conf.template
+# 契约与示例：references/search-sites.md
+# =============================================================
+#
+# 模板占位符：{query} = URL 编码后的关键词，{page} = 页码（从 1 起）
+# 命令形式的源还会收到环境变量 A2_QUERY / A2_PAGE / A2_PAGES
+#
+# 形式 1：HTML 搜索结果页（脚本自动抽 magnet 链接、标题、体积、做种数）
+#   site=<名字>|<URL 模板>
+# 示例（把 example.org 换成你自己在用的站点）：
+#   site=某站|https://example.org/search?q={query}&page={page}
+#
+# 形式 2：你自己的命令，输出 JSON 行（字段表见 references/search-sites.md）
+#   site=<名字>|cmd:<命令>
+# 示例（离线自测，不联网）：
+#   site=本地演示|cmd:python3 __HOME__/.aria2/search-source-demo.py
+#
+# 全网发现：一个通用搜索页，用来找「还有哪些页面/站点有资源」
+websearch=https://www.bing.com/search?q={query}
