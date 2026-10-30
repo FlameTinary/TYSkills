@@ -1,21 +1,21 @@
 #!/bin/bash
 # 批量下载 AList 中的整个目录
 # 用法: a2-alist-dir "AList目录路径" [输出目录] [文件过滤]
-# 示例: a2-alist-dir "/aliyun/电影" ${A2_MEDIA_ROOT:-$HOME/media}/Movies
-#       a2-alist-dir "/aliyun/剧集" ${A2_MEDIA_ROOT:-$HOME/media}/TV "*.mkv"
+# 示例: a2-alist-dir "/aliyun/电影" $(a2-dest media)/Movies
+#       a2-alist-dir "/aliyun/剧集" $(a2-dest media)/TV "*.mkv"
 
 ALIST_URL="http://localhost:5244"
 USERNAME="admin"
 PASSWORD_FILE="$HOME/.alist/admin_password.txt"
-DEFAULT_OUTPUT="${A2_DOWNLOAD_DIR:-$HOME/Downloads}"
+DEFAULT_OUTPUT="${A2_DOWNLOAD_DIR:-$(a2-dest 2>/dev/null || echo "$HOME/Downloads")}"
 
 if [ -z "$1" ]; then
     echo "用法: a2-alist-dir \"AList目录路径\" [输出目录] [文件过滤]"
     echo ""
     echo "示例:"
     echo "  a2-alist-dir \"/aliyun/长安的荔枝\""
-    echo "  a2-alist-dir \"/aliyun/电影\" ${A2_MEDIA_ROOT:-$HOME/media}/Movies"
-    echo "  a2-alist-dir \"/aliyun/剧集\" ${A2_MEDIA_ROOT:-$HOME/media}/TV \"*.mkv\""
+    echo "  a2-alist-dir \"/aliyun/电影\" $(a2-dest media)/Movies"
+    echo "  a2-alist-dir \"/aliyun/剧集\" $(a2-dest media)/TV \"*.mkv\""
     exit 1
 fi
 
@@ -94,7 +94,7 @@ while IFS= read -r FILENAME; do
       -d "{\"path\":\"$FILE_PATH\",\"password\":\"\"}" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['data']['raw_url'] if d.get('code')==200 else '')" 2>/dev/null)
     
     if [ -n "$RAW_URL" ]; then
-        a2 add -d "$OUTPUT_DIR" "$RAW_URL" > /dev/null 2>&1
+        a2 add --dir "$OUTPUT_DIR" "$RAW_URL" > /dev/null 2>&1
         if [ $? -eq 0 ]; then
             echo "  ✓ $FILENAME"
             SUCCESS=$((SUCCESS + 1))

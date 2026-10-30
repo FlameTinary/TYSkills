@@ -3,7 +3,7 @@
 # a2（aria2 高级封装）一键部署脚本 —— macOS / Linux / Windows(WSL、Git Bash)
 # 幂等：重复运行安全；已有配置（aria2.conf、a2.conf、服务定义）一律不覆盖。
 # 用法: bash scripts/install-a2.sh
-# 依赖: aria2c、python3、curl；ffprobe 可选（入库完整性校验，强烈建议）
+# 依赖: aria2c、python3、curl
 # 服务名: 默认 com.example.aria2（macOS 服务名 / Linux systemd unit 名 / Windows 计划任务名），
 #         用 A2_SERVICE=a2.aria2 之类换成自己的
 # 平台适配：
@@ -17,7 +17,6 @@ SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"     # 技能根目�
 ARIA2_DIR="$HOME/.aria2"
 BIN_DIR="$HOME/.local/bin"
 SERVICE="${A2_SERVICE:-com.example.aria2}"
-MEDIA_ROOT="${A2_MEDIA_ROOT:-$HOME/media}"
 
 case "$(uname -s 2>/dev/null || echo unknown)" in
   Darwin)                         PLAT=mac ;;
@@ -45,59 +44,19 @@ if [ -n "$missing" ]; then
   esac
   exit 1
 fi
-command -v ffprobe >/dev/null 2>&1 || echo "提示: 未找到 ffprobe（装 ffmpeg 即可），入库将跳过完整性校验"
 
 # ---------- 1) 目录与必存空文件（aria2.session 不存在时 aria2 会直接报错退出） ----------
 mkdir -p "$ARIA2_DIR" "$BIN_DIR"
-touch "$ARIA2_DIR/aria2.session" "$ARIA2_DIR/aria2.log" \
-      "$ARIA2_DIR/move.log" "$ARIA2_DIR/move.lock"
+touch "$ARIA2_DIR/aria2.session" "$ARIA2_DIR/aria2.log"
 
-# 媒体库根：只在「不会凭空建到系统盘上」时创建（外接盘/网络盘没挂载则跳过并提示）
-media_creatable() {
-  [ -d "$MEDIA_ROOT" ] && return 0
-  [ "${A2_ALLOW_CREATE:-0}" = "1" ] && return 0
-  python3 - "$MEDIA_ROOT" <<'PY'
-import os, sys
-p = os.path.abspath(os.path.expanduser(sys.argv[1]))
-home = os.path.abspath(os.path.expanduser("~"))
-if p == home or p.startswith(home.rstrip(os.sep) + os.sep):
-    sys.exit(0)
-anc = p
-while not os.path.exists(anc):
-    parent = os.path.dirname(anc)
-    if not parent or parent == anc:
-        break
-    anc = parent
-if not os.path.exists(anc):
-    sys.stderr.write("路径所在位置不可用（盘符/挂载点不存在）：%s\n" % p)
-    sys.exit(1)
-try:
-    if os.stat(anc).st_dev != os.stat(home).st_dev:
-        sys.exit(0)
-except OSError:
-    sys.exit(0)
-sys.stderr.write("%s 不存在，且会被创建到系统盘上（外接盘/网络盘多半没挂载）。\n" % p)
-sys.stderr.write("  确认要建在系统盘上：mkdir -p '%s'，或设 A2_ALLOW_CREATE=1。\n" % p)
-sys.exit(1)
-PY
-}
-if media_creatable; then
-  mkdir -p "$MEDIA_ROOT"
-  for d in Movies TV Private .incoming/Movies .incoming/TV .incoming/Private .incoming/_unsorted; do
-    mkdir -p "$MEDIA_ROOT/$d"
-  done
-  echo "媒体库目录就绪 -> $MEDIA_ROOT/{Movies,TV,Private,.incoming/…}"
-else
-  echo "提示: 媒体库根 $MEDIA_ROOT 不存在且会被建到系统盘上（外接盘/网络盘没挂载？）——已跳过创建。"
-  echo "      接好盘后重跑本脚本，或 mkdir -p \"$MEDIA_ROOT\"，或设 A2_ALLOW_CREATE=1。"
-fi
-
-# ---------- 2) 核心脚本：a2 主程序 + 入库钩子 + 文件名清洗 + 启动器 ----------
+# ---------- 2) 核心脚本：a2 主程序 + 落点配置 + 启动器 ----------
 install -m 755 "$SKILL_DIR/scripts/a2"             "$ARIA2_DIR/a2"
-install -m 644 "$SKILL_DIR/scripts/nameclean.py"   "$ARIA2_DIR/nameclean.py"
-install -m 755 "$SKILL_DIR/scripts/on-complete.py" "$ARIA2_DIR/on-complete.py"
 install -m 755 "$SKILL_DIR/scripts/start-aria2.sh" "$ARIA2_DIR/start-aria2.sh"
-echo "已安装核心脚本 -> $ARIA2_DIR/{a2,nameclean.py,on-complete.py,start-aria2.sh}"
+install -m 755 "$SKILL_DIR/scripts/a2-dest"        "$BIN_DIR/a2-dest"
+echo "已安装核心脚本 -> $ARIA2_DIR/{a2,start-aria2.sh} + $BIN_DIR/a2-dest"
+# 落点配置：首次运行按 OS 生成默认下载目录（已存在则沿用，不覆盖用户改过的值）
+"$BIN_DIR/a2-dest" >/dev/null
+echo "默认下载目录 -> $("$BIN_DIR/a2-dest")（改：a2-dest set <目录>）"
 
 # ---------- 3) a2 软链进 PATH（本体在 ~/.aria2/a2，软链到 ~/.local/bin/a2） ----------
 ln -sf "$ARIA2_DIR/a2" "$BIN_DIR/a2"
@@ -193,10 +152,11 @@ esac
 sleep 2
 echo "== 验证 =="
 curl -s -o /dev/null -w "AList  http:%{http_code}\n" http://localhost:5244 --max-time 3 || true
-a2 st 2>/dev/null || echo "RPC 未就绪：确认守护进程在跑（macOS: launchctl print gui/$(id -u)/$SERVICE｜Linux: systemctl --user status $SERVICE），并检查 $ARIA2_DIR/aria2.conf"
+a2 st 2>/dev/null || echo "RPC 未就绪：确认守护进程在跑（macOS: launchctl print gui/$(id -u)/${SERVICE}｜Linux: systemctl --user status ${SERVICE}），并检查 $ARIA2_DIR/aria2.conf"
 cat <<EOF
 == 完成。常用命令：
-     a2 st / a2 ls / a2 add "<磁力或链接>" / a2 sweep
+     a2 st / a2 ls / a2-dest / a2-dest set <目录>
+     a2 add --dir "$(${BIN_DIR}/a2-dest)" "<磁力或链接>"      # 落点必须显式给
    搜索要先配源（a2 不内置任何站点），在 $ARIA2_DIR/a2.conf 里改这一行：
      tor-source-cmd=<你的搜索源命令>
    想先跑通流程（离线、不联网）：

@@ -107,8 +107,6 @@ summary-interval=60
 # 模板见本技能 assets/a2.conf.template（install-a2.sh 会自动装好）。
 # 搜索源的契约与示例：references/tor-source.md
 
-## ===================== 事件钩子 =====================
-# 下载完成：媒体任务（落在 .incoming 暂存区）自动搬进 Jellyfin 媒体库；普通下载不受影响
-on-download-complete=__HOME__/.aria2/on-complete.py
-# 下载失败钩子同理
-# on-download-error=__HOME__/.aria2/on_error.sh
+## ===================== 事件钩子（默认不装） =====================
+# a2 不做自动改名/入库：文件就落在 --dir 给的目录里，所以这里不需要 on-download-complete。
+# 需要自己的钩子（通知、转码…）再加，键名是 on-download-complete=<绝对路径的可执行文件>

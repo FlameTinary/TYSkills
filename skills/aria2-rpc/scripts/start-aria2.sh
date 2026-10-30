@@ -1,18 +1,27 @@
 #!/bin/sh
 # aria2 启动器（服务管理器 / 终端 / cron 都用它，保证各条启动路径行为一致）
 # 平台：macOS、Linux、WSL、Git Bash 等有 sh 的环境都可用（Windows 原生建议走 WSL）
-#   1) 校验目标目录可用 —— 目录不存在、且会被创建在系统盘上（外接盘/网络盘没挂载的典型表现）
+#   1) 校验落点目录可用 —— 目录不存在、且会被创建在系统盘上（外接盘/网络盘没挂载的典型表现）
 #      就拒绝启动，避免把几十 GB 悄悄写进系统盘。确认要建在系统盘上：设 A2_ALLOW_CREATE=1
 #      临时回退（只用系统盘的下载目录）：A2_FALLBACK_DIR=~/Downloads
-#   2) 媒体库根 / 默认下载目录由 A2_MEDIA_ROOT（默认 ~/media）/ A2_DOWNLOAD_DIR（默认 ~/Downloads）配置
-#   3) 自测不可用分支：A2_MEDIA_ROOT=/不存在的挂载点/媒体 ./start-aria2.sh
+#   2) 落点来自 skill 层的落点配置 ~/.aria2/dest.conf（a2-dest 维护）：
+#      download-dir=默认下载目录，media-root=媒体库根（可选）。a2 只认 --dir，不读这两个键。
+#   3) 自测不可用分支：A2_DEST_CONF=/tmp/x.conf（download-dir 指向不存在的挂载点）./start-aria2.sh
 set -u
 
 CONF=${A2_CONF:-$HOME/.aria2/aria2.conf}
+DEST_CONF=${A2_DEST_CONF:-$HOME/.aria2/dest.conf}
 ARIA2=${A2_ARIA2:-$(command -v aria2c 2>/dev/null || true)}
-MEDIA_ROOT=${A2_MEDIA_ROOT:-$HOME/media}
-DOWNLOAD_DIR=${A2_DOWNLOAD_DIR:-$HOME/Downloads}
 FALLBACK=${A2_FALLBACK_DIR:-}
+
+dest_get() {
+  [ -f "$DEST_CONF" ] || return 0
+  sed -n "s/^$1=//p" "$DEST_CONF" | tail -1
+}
+
+DOWNLOAD_DIR=$(dest_get download-dir)
+MEDIA_DIR=$(dest_get media-root)
+[ -n "$DOWNLOAD_DIR" ] || DOWNLOAD_DIR=$HOME/Downloads
 
 case "${1:-}" in
   --version|-v|--help|-h)
@@ -63,12 +72,20 @@ sys.exit(1)
 PY
 }
 
-if ! dir_ok "$MEDIA_ROOT"; then
+failed=""
+how=""
+if ! dir_ok "$DOWNLOAD_DIR"; then
+  failed="$DOWNLOAD_DIR"; how="下载目录"
+elif [ -n "$MEDIA_DIR" ] && [ "$MEDIA_DIR" != "$DOWNLOAD_DIR" ] && ! dir_ok "$MEDIA_DIR"; then
+  failed="$MEDIA_DIR"; how="媒体库根"
+fi
+
+if [ -n "$failed" ]; then
   if [ -n "$FALLBACK" ]; then
-    echo "aria2: 媒体库 ${MEDIA_ROOT} 当前不可用 —— 本次回退到 ${FALLBACK}（临时模式，接好盘后请重启）" >&2
+    echo "aria2: ${how} ${failed} 当前不可用 —— 本次回退到 ${FALLBACK}（临时模式，接好盘后请重启）" >&2
     exec "$ARIA2" --conf-path="$CONF" --dir="$FALLBACK" "$@"
   fi
-  echo "aria2: 媒体库 ${MEDIA_ROOT} 当前不可用，拒绝启动（避免写进系统盘）。" >&2
+  echo "aria2: ${how} ${failed} 当前不可用，拒绝启动（避免写进系统盘）。" >&2
   echo "       接好盘后重试；确需临时用系统盘：A2_FALLBACK_DIR=$DOWNLOAD_DIR $0" >&2
   exit 78
 fi

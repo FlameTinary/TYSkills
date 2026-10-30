@@ -4,7 +4,7 @@
 
 ALIST_URL="http://localhost:5244"
 USERNAME="admin"
-DEFAULT_OUTPUT="${A2_DOWNLOAD_DIR:-$HOME/Downloads}"
+DEFAULT_OUTPUT="${A2_DOWNLOAD_DIR:-$(a2-dest 2>/dev/null || echo "$HOME/Downloads")}"
 PASSWORD_FILE="$HOME/.alist/admin_password.txt"
 
 if [ -z "$1" ]; then
@@ -12,7 +12,7 @@ if [ -z "$1" ]; then
     echo ""
     echo "示例:"
     echo "  a2-alist \"/aliyun/长安的荔枝/05 4K.mp4\""
-    echo "  a2-alist \"/aliyun/电影.mkv\" ${A2_MEDIA_ROOT:-$HOME/media}/Movies"
+    echo "  a2-alist \"/aliyun/电影.mkv\" $(a2-dest media)/Movies"
     exit 1
 fi
 
@@ -79,7 +79,7 @@ mkdir -p "$OUTPUT_DIR"
 
 # 添加到 a2
 echo "正在添加下载任务..."
-a2 add -d "$OUTPUT_DIR" "$RAW_URL"
+a2 add --dir "$OUTPUT_DIR" "$RAW_URL"
 
 echo ""
 echo "任务已添加！用 'a2 list' 查看进度"

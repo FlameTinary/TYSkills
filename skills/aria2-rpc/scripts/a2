@@ -2,18 +2,15 @@
 """a2 —— aria2 RPC 命令行封装（macOS / Linux / Windows 通用；配套 .sh 脚本在 Windows 上用 WSL 或 Git Bash）。
 端口与密钥自动从 ~/.aria2/aria2.conf 读取。
 
+落点由调用方决定：a2 只把文件下到你用 --dir 给的目录，不推断分类、不改名、不搬动。
+默认下载目录（以及需要时的子目录）属于 skill 的决策，配套命令 a2-dest 负责
+首次按 OS 生成默认值并持久化（~/.aria2/dest.conf）。
+
 用法:
-  a2 add [-p] [-m|-t|-P|-flat|-d 目录] [-o 文件名] <url|magnet|file.torrent|urls.txt> ...
-        -m 强制当电影(→媒体库/Movies)   -t 强制当剧集(→媒体库/TV)
-        -P 强制当私藏(→媒体库/Private；不看名字，成人/私藏资源走这个)
-        -d DIR 指定任意保存目录（直接落 DIR，不进暂存区、不会被自动改名/入库）
-        -flat 强制落 conf 里的默认下载目录（不进媒体库）  -p 加入后先暂停  -o 指定保存文件名
-        默认：名字里像电影/剧集（S01E02、1x02、第03集、第二季、第1-4季、全24集、合集、年份+1080p 等）
-        → 进媒体库暂存区（${A2_MEDIA_ROOT}/.incoming），完成后自动入库；普通文件（zip/pdf/iso…）落 conf
-        的默认下载目录（默认 ~/Downloads，可用 A2_DOWNLOAD_DIR 覆盖）；
-        裸磁力（只有 btih、无名称）先落 .incoming/_unsorted，下载完按实际文件名判断后入库
+  a2 add --dir DIR [-p] [-o 文件名] <url|magnet|file.torrent|urls.txt> ...
+        --dir DIR   必填：下到 DIR（不存在则创建；只下载，不改名、不搬动）
+        -p 加入后先暂停   -o 指定保存文件名
   空间保护：目标盘剩余 < 20GB 时拒绝加任务（可用 A2_MIN_FREE_GB=5 临时放宽）
-  a2 sweep              手动把暂存区里已完成但没自动入库的文件搬进媒体库
   a2 ls [-a]            任务列表（默认活动+等待，-a 含已结束）
   a2 st                 全局速率/任务数
   a2 info <gid>         单任务详情
@@ -33,14 +30,13 @@
         绝不会因为源挂了而显示成「没有结果」。
         缓存 ~/.aria2/find-cache.json（只存源返回的原始行，换过滤参数不互相污染），
         grab 的序号按「过滤+排序后的视图」取。
-  a2 grab <序号|标题片段|infohash|磁力> [-t|-m|-P|-flat|-d 目录] [-p] [-o 文件名] [--no-verify]
+  a2 grab <序号|标题片段|infohash|磁力> --dir DIR [-p] [-o 文件名] [--no-verify]
         取该条的磁力 → 默认先用 bt-metadata-only 拉真实元数据校验（有些源标的做种数会撒谎：
-        标着 seeds 5 的种子可能一个字节元数据都拉不到），通过才入库；--no-verify 跳过校验。
+        标着 seeds 5 的种子可能一个字节元数据都拉不到），通过才下到 DIR；--no-verify 跳过校验。
 gid 可用前 6 位以上的前缀；限速改动只在本次运行有效，持久化请改 conf 后重启守护。
-媒体落点：${A2_MEDIA_ROOT}/{Movies,TV,Private}（默认 ~/media），下载中暂存 ${A2_MEDIA_ROOT}/.incoming/…。
 搜索源自己负责限流与重试：a2 每页只调用一次源命令，并把关键词/页码传给它（A2_QUERY/A2_PAGE/A2_PAGES）。
 """
-import base64, hashlib, json, os, re, shutil, subprocess, sys, time
+import base64, hashlib, json, os, re, subprocess, sys, time
 import urllib.error, urllib.parse, urllib.request
 
 CONF = os.path.expanduser(os.environ.get("A2_CONF", "~/.aria2/aria2.conf"))   # 测试/多实例可换
@@ -69,28 +65,6 @@ def conf_get(key, default):
 def rc_get(key, default):
     """读 a2.conf（a2 专有配置）。"""
     return key_get(RC, key, default)
-
-# ffprobe 常见安装位置（跨平台兜底；同样适用于没配好 PATH 的服务管理器）
-FFPROBE_CANDIDATES = (
-    "/opt/homebrew/bin/ffprobe",            # macOS (Apple Silicon, Homebrew)
-    "/usr/local/bin/ffprobe", "/usr/bin/ffprobe",   # macOS Intel / Homebrew / 发行版包管理
-    "/snap/bin/ffprobe", "/var/lib/flatpak/exports/bin/ffprobe",   # Linux 通用包
-    os.path.join(os.path.expanduser("~"), "scoop", "shims", "ffprobe.exe"),   # Windows scoop
-    r"C:\ProgramData\chocolatey\bin\ffprobe.exe",                             # Windows choco
-    r"C:\Program Files\ffmpeg\bin\ffprobe.exe",                               # Windows 手动解压
-)
-
-
-def find_ffprobe():
-    """找 ffprobe：先 PATH，再常见安装位置；找不到返回 None。"""
-    p = shutil.which("ffprobe")
-    if p:
-        return p
-    for c in FFPROBE_CANDIDATES:
-        if os.path.isfile(c) and os.access(c, os.X_OK):
-            return c
-    return None
-
 
 # ---------- 跨平台小工具（macOS / Linux / Windows 通用，不做任何系统特有假设）----------
 
@@ -168,24 +142,8 @@ def service_status_hint():
         return "schtasks /Query /TN %s /V" % SERVICE
     return "systemctl --user status %s" % SERVICE
 
-# ---------- 入库文件名清洗（去站点广告；与 on-complete.py 共用同一份规则）----------
-sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
-try:
-    from nameclean import clean_name, clean_tree
-except Exception:                                    # 模块缺失也不能影响基本功能
-    def clean_name(n):
-        return n
-
-    def clean_tree(path, depth=2, log=None):
-        return []
-
-# ---------- 媒体落点：电影/剧集 → 媒体库根（A2_MEDIA_ROOT），其余仍落 conf 里的 dir ----------
-# 媒体库根含 Movies/TV/Private 三个子目录，需用户自行创建；默认 ~/media，可用环境变量覆盖
-MEDIA_ROOT = os.path.expanduser(os.environ.get("A2_MEDIA_ROOT", "~/media"))
-MOVIE_DIR = MEDIA_ROOT + "/Movies"
-TV_DIR = MEDIA_ROOT + "/TV"
-PRIVATE_DIR = MEDIA_ROOT + "/Private"     # 私藏库（-P）；也是 Jellyfin 库根，只放完整条目
-STAGING = MEDIA_ROOT + "/.incoming"          # 下载中先落这里，完成后由 on-complete.py 搬进库目录
+# ---------- 搜索结果的分类判定（只服务 find 的过滤，与下载落点无关）----------
+# 落点由调用方的 --dir 决定；这里只把标题文本归成 Movies / TV，供搜索过滤与展示用。
 VIDEO_EXT = (".mkv", ".mp4", ".avi", ".ts", ".m2ts", ".mov", ".wmv", ".flv",
              ".rmvb", ".mpg", ".m4v")
 TV_RE = re.compile(r"(?i)(s\d{1,2}[\s._-]*e\d{1,3}|(?<!\d)\d{1,2}x\d{2}(?!\d)|"
@@ -193,14 +151,15 @@ TV_RE = re.compile(r"(?i)(s\d{1,2}[\s._-]*e\d{1,3}|(?<!\d)\d{1,2}x\d{2}(?!\d)|"
                    r"[全共]\s?[\d一二三四五六七八九十]{0,4}\s?[集季]|合集|season[\s._-]?\d|"
                    r"\bep\s?\d{1,3}\b|"
                    r"s\d{1,2}(?!\d)(?![\s._-]*e\d{1,2}))")
-#                                                                  ↑ 整季包常只写 `S01`（不带 E），
-# 少了这一支就会因为标题里的 1080p 被当成电影（实测：`Show S01 COMPLETE 1080p` 落进了 Movies）。
-# 负向断言避开 `S01E03`（那是单集，由第一支命中）与 `S2024` 这种四位数。
+#    ↑ 整季包常只写 `S01`（不带 E）；少了这一支，搜索过滤会把整季包误判成非剧集。
+#    负向断言避开 `S01E03`（那是单集，由第一支命中）与 `S2024` 这种四位数。
 QUALITY_RE = re.compile(r"(?i)(\b(19|20)\d{2}\b|1080p|2160p|720p|480p|\b4k\b|blu-?ray|"
                         r"web-?dl|webrip|hdtv|remux|hdr|dvdrip|bdrip)")
 
 
 MIN_FREE_GB = float(os.environ.get("A2_MIN_FREE_GB", "20"))   # 目标盘最低余量，低于则拒绝加任务
+# 已删除的落点参数：命中时给出明确的迁移提示，而不是含糊的「无法识别」
+REMOVED_FLAGS = ("-m", "--movie", "-t", "--tv", "-P", "--private", "-flat", "--flat", "-d")
 
 
 def free_gb(path):
@@ -237,84 +196,24 @@ def volume_ok(path):
     return ok
 
 
-def target_name(a):
-    """从 URL/磁力/种子文件里猜出资源名（用于分类）。猜不到返回 ''。"""
-    a = a.strip()
-    if a.startswith("magnet:"):
-        q = urllib.parse.parse_qs(urllib.parse.urlsplit(a).query)
-        return (q.get("dn") or [""])[0]
-    if a.startswith(("http://", "https://", "ftp://", "sftp://")):
-        return urllib.parse.unquote(os.path.basename(urllib.parse.urlsplit(a).path))
-    if a.endswith(".torrent") and os.path.exists(a):
-        data = open(a, "rb").read()
-        i = data.find(b"4:name")
-        if i != -1:
-            try:
-                j = i + 6
-                k = data.index(b":", j)
-                return data[k + 1:k + 1 + int(data[j:k])].decode("utf-8", "replace")
-            except (ValueError, UnicodeDecodeError):
-                pass
-    return ""
+def resolve_dir(dest):
+    """把调用方给的目录变成 aria2 的 dir。**必填**：a2 不推断任何落点。
 
-
-def route(name, force, is_bt=False, dest_dir=None):
-    """(目标目录或 ''(=用 conf 的 dir), 说明文字)。
-    force ∈ {None,'movie','tv','private','flat'}；dest_dir = -d 指定的任意目录（优先级最高）。"""
-    default_dir = conf_get("dir", os.path.expanduser(os.environ.get("A2_DOWNLOAD_DIR", "~/Downloads")))
-    if dest_dir:
-        # -d：直接落用户指定的目录，不进暂存区 —— 因此在 .incoming 之外，钩子不会碰它
-        p = os.path.abspath(os.path.expanduser(dest_dir))
-        if not volume_ok(p):
-            sys.exit("指定目录当前不可用：%s\n    ↓ %s\n    %s" % (p, LAST_PATH_REASON[0], HINT_CREATE))
-        try:
-            os.makedirs(p, exist_ok=True)
-        except OSError as exc:
-            sys.exit("指定目录不可用: %s (%s)" % (p, exc))
-        note = "指定目录 → %s（直达，不经暂存/自动入库）" % p
-        if p in (MOVIE_DIR, TV_DIR, PRIVATE_DIR):
-            note += "；⚠️ 这是媒体库根目录，中转文件也会出现在 Jellyfin 里，建议改用 -m/-t/-P"
-        return p, note
-    if force == "flat":
-        return "", "强制落 %s" % default_dir
-    if force == "private":
-        # 私藏库：名字像不像影视都进这里 —— 分类正则对这类资源故意不生效（-P 是唯一判据）
-        if not volume_ok(MEDIA_ROOT):
-            sys.exit("媒体库当前不可用，媒体下载已中止：%s\n    ↓ %s\n    %s"
-                     % (MEDIA_ROOT, LAST_PATH_REASON[0], HINT_CREATE))
-        stage = os.path.join(STAGING, "Private")
-        try:
-            os.makedirs(stage, exist_ok=True)
-        except OSError as exc:
-            sys.exit("暂存目录不可用: %s (%s)" % (stage, exc))
-        return stage, "私藏（暂时落 %s，完成后自动移入 %s）" % (stage, PRIVATE_DIR)
-    if not name:
-        if force in ("movie", "tv"):
-            cat = force
-        elif is_bt:
-            # 磁力/种子没带名称：先落 _unsorted，下载完由钩子按实际文件名入库
-            if not volume_ok(MEDIA_ROOT):
-                sys.exit("媒体库当前不可用，媒体下载已中止：%s\n    ↓ %s\n    %s"
-                         % (MEDIA_ROOT, LAST_PATH_REASON[0], HINT_CREATE))
-            return os.path.join(STAGING, "_unsorted"), \
-                "磁力未带名称 → 暂存 %s/_unsorted，完成后按实际文件名判断电影/剧集再入库" % STAGING
-        else:
-            return "", "无法判断类型，落 %s（要进媒体库请加 -m / -t）" % default_dir
-    else:
-        looks_media = bool(TV_RE.search(name)) or name.lower().endswith(VIDEO_EXT) \
-            or bool(QUALITY_RE.search(name))
-        if force is None and not looks_media:
-            return "", "普通下载 → %s" % default_dir
-        cat = force if force in ("movie", "tv") else ("tv" if TV_RE.search(name) else "movie")
-    if not volume_ok(MEDIA_ROOT):
-        sys.exit("媒体库当前不可用，媒体下载已中止：%s\n    ↓ %s\n    %s"
-                 % (MEDIA_ROOT, LAST_PATH_REASON[0], HINT_CREATE))
-    label = "剧集" if cat == "tv" else "电影"
-    lib = TV_DIR if cat == "tv" else MOVIE_DIR
-    return os.path.join(STAGING, "TV" if cat == "tv" else "Movies"), \
-        "%s（暂时落 %s/%s，完成后自动移入 %s）" % (label, STAGING, "TV" if cat == "tv" else "Movies", lib)
-
-
+    a2 只做「能不能下到这里」的检查（盘在不在、能不能写），不分类、不改名、不搬动 ——
+    落点决策属于调用方（skill 用 a2-dest 给出默认目录与分类子目录）。
+    """
+    if not dest:
+        sys.exit("缺少目标目录：a2 add --dir <目录> <输入>\n"
+                 "  a2 只下到你显式指定的目录，不推断分类/默认库路径。\n"
+                 "  默认下载目录见 a2-dest（首次按 OS 生成并持久化）。")
+    p = os.path.abspath(os.path.expanduser(dest))
+    if not volume_ok(p):
+        sys.exit("指定目录当前不可用：%s\n    ↓ %s\n    %s" % (p, LAST_PATH_REASON[0], HINT_CREATE))
+    try:
+        os.makedirs(p, exist_ok=True)
+    except OSError as exc:
+        sys.exit("指定目录不可用: %s (%s)" % (p, exc))
+    return p
 
 def rpc(method, params=None):
     body = json.dumps({"jsonrpc": "2.0", "id": "a2", "method": method,
@@ -384,194 +283,63 @@ def row(t):
         human(t.get("downloadSpeed", 0)) + "/s", name_of(t))
 
 
-def cmd_add(args, name_hint=None):
-    opts, force, out, dest_dir = {}, None, None, None
+ADD_USAGE = """a2 add —— 下载到你指定的目录（a2 不决定落点）
+用法: a2 add --dir DIR [-p] [-o 文件名] <url|magnet|file.torrent|urls.txt> ...
+  --dir DIR      必填：下到 DIR（不存在则创建；只下载，不改名、不搬动）
+  -p / --pause   加入后先暂停
+  -o / --out 名字 指定保存文件名
+输入形式：URL、磁力、本地 .torrent、文本文件（每行一个链接，# 注释）
+落点：只由 --dir 决定。默认目录与子目录分类由 skill 负责（见 a2-dest）。
+空间保护：目标盘剩余 < A2_MIN_FREE_GB（默认 20GB）时拒绝加任务。"""
+
+
+def cmd_add(args):
+    if args and args[0] in ("-h", "--help", "help"):
+        print(ADD_USAGE)
+        return 0
+    opts, out, dest = {}, None, None
     while args and args[0].startswith("-"):
         flag, args = args[0], args[1:]
         if flag in ("-p", "--pause"):
             opts["pause"] = "true"
-        elif flag in ("-m", "--movie"):
-            force = "movie"
-        elif flag in ("-t", "--tv"):
-            force = "tv"
-        elif flag in ("-P", "--private"):
-            force = "private"
-        elif flag in ("-d", "--dir") and args:
-            dest_dir, args = args[0], args[1:]
-        elif flag in ("-flat", "--flat"):
-            force = "flat"
+        elif flag == "--dir" and args:
+            dest, args = args[0], args[1:]
         elif flag in ("-o", "--out") and args:
             out, args = args[0], args[1:]
+        elif flag in REMOVED_FLAGS:
+            sys.exit("已移除的选项: %s\n"
+                     "  a2 不再决定落点：只用 --dir <目录> 指下到哪，"
+                     "分类（电影/剧集/私藏）与入库由 skill 决定。" % flag)
         else:
-            sys.exit("无法识别的选项或缺少参数: %s" % flag)
+            sys.exit("无法识别的选项或缺少参数: %s（a2 add 只接受 --dir / -p / -o）" % flag)
     if not args:
-        sys.exit("缺少下载目标")
+        sys.exit("缺少下载目标\n" + ADD_USAGE)
 
-    def decide(a):
-        is_bt = a.startswith("magnet:") or a.endswith(".torrent")
-        dest, note = route(out or name_hint or target_name(a), force, is_bt, dest_dir)
-        g = ensure_space(dest or conf_get("dir", "."))
-        if g is not None:
-            note = "%s ｜ 目标盘剩余 %.0f GB" % (note, g)
-        return dest, note
+    dest = resolve_dir(dest)
+    note = "→ %s" % dest
+    g = ensure_space(dest)
+    if g is not None:
+        note += "（目标盘剩余 %.0f GB）" % g
 
     for a in args:
-        dest, note = decide(a)
+        o = dict(opts)
+        if out:
+            o["out"] = out
+        o["dir"] = dest
         if a.startswith(("http://", "https://", "ftp://", "magnet:", "sftp://")):
-            o = dict(opts)
-            if out:
-                o["out"] = out
-            if dest:
-                o["dir"] = dest
             print("+ %s  %s\n    %s" % (rpc("aria2.addUri", [[a], o]), a, note))
         elif a.endswith(".torrent") and os.path.exists(a):
-            o = dict(opts)
-            if dest:
-                o["dir"] = dest
             with open(a, "rb") as fh:
                 gid = rpc("aria2.addTorrent", [base64.b64encode(fh.read()).decode(), [], o])
             print("+ %s  %s\n    %s" % (gid, a, note))
         elif a.endswith(".txt") and os.path.exists(a):
-            for u in (l.strip() for l in open(a) if l.strip() and not l.startswith("#")):
-                d, n = decide(u)
-                o = dict(opts)
-                if d:
-                    o["dir"] = d
-                print("+ %s  %s\n    %s" % (rpc("aria2.addUri", [[u], o]), u, n))
+            with open(a) as fh:
+                urls = [l.strip() for l in fh if l.strip() and not l.startswith("#")]
+            for u in urls:
+                print("+ %s  %s\n    %s" % (rpc("aria2.addUri", [[u], dict(o)]), u, note))
         else:
             print("跳过无法识别的内容: %s" % a)
 
-
-def done_entries():
-    """{(任务目录, 顶层条目)} —— aria2 认定"数据已完整"的条目，sweep 的唯一完成判据。
-
-    为什么不能再看 <条目>.aria2 在不在：conf 里 force-save=true 让完成任务的片段文件永久保留，
-    而 aria2 触发钩子的顺序是「下载完成 → 保存片段文件 → 执行钩子」（aria2.log 实测），
-    所以"没有控制文件"永远不成立，什么都搬不动——三个 BT 剧集就这样在 .incoming 躺了一夜。"""
-    fields = ["dir", "files", "completedLength", "totalLength"]
-    out = set()
-    for method, params in (("aria2.tellActive", [fields]),
-                           ("aria2.tellWaiting", [0, 1000, fields]),
-                           ("aria2.tellStopped", [0, 1000, fields])):
-        for t in rpc(method, params):
-            try:
-                total = int(t.get("totalLength") or 0)
-                got = int(t.get("completedLength") or 0)
-            except (TypeError, ValueError):
-                continue
-            if total <= 0 or got < total:
-                continue
-            d = (t.get("dir") or "").rstrip("/")
-            for f in t.get("files") or []:
-                p = f.get("path") or ""
-                if p.startswith(d + "/"):
-                    out.add((d, p[len(d) + 1:].split("/")[0]))
-                elif p == d:
-                    out.add((d, os.path.basename(p)))
-    return out
-
-
-def media_guard(path):
-    """入库前的完整性守卫：条目里最大的视频文件必须能被 ffprobe 解析。
-    按绝对路径兜底找 ffprobe：服务管理器拉起的进程 PATH 很窄（macOS 的 launchd 里没有
-    Homebrew，Linux 的 systemd --user 里通常没有 /usr/local/bin）。返回 None=通过。"""
-    probe = find_ffprobe()
-    if not probe:
-        return None
-    if os.path.isdir(path):
-        files = []
-        for root, _dirs, names in os.walk(path):
-            for nm in names:
-                if nm.lower().endswith(VIDEO_EXT):
-                    fp = os.path.join(root, nm)
-                    try:
-                        files.append((os.path.getsize(fp), fp))
-                    except OSError:
-                        pass
-        if not files:
-            return None
-        target = max(files)[1]
-    elif path.lower().endswith(VIDEO_EXT):
-        target = path
-    else:
-        return None
-    try:
-        r = subprocess.run([probe, "-v", "error", "-show_entries", "format=duration",
-                            "-of", "default=nw=1:nk=1", target],
-                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180)
-    except Exception as exc:                      # noqa: BLE001
-        return "ffprobe 没能跑起来: %s" % exc
-    if r.returncode != 0 or not r.stdout.strip():
-        err = (r.stderr.decode("utf-8", "replace").strip().splitlines() or
-               ["exit=%d" % r.returncode])[-1]
-        return "ffprobe 校验不过（文件可能不完整）: %s" % err
-    return None
-
-
-def sweep(_args=None):
-    """把暂存目录里已完成、但没被钩子搬走的条目搬进媒体库，并清理残留控制文件。
-    _unsorted（磁力没带名称时落的地方）会按实际条目名判断电影/剧集。
-    完成判据取自 aria2 的 RPC（见 done_entries），不看控制文件在不在；搬迁前用 ffprobe 兜一道。"""
-    import time
-    moved = cleaned = 0
-    try:
-        done = done_entries()
-        offline = False
-    except SystemExit as exc:            # RPC 不可用 → 离线模式：只靠 ffprobe 守卫，且明确警告
-        print("警告：RPC 不可用（%s）\n      改用离线模式：只做 ffprobe 校验，无法确认 aria2 是否认为完整。" % exc)
-        done, offline = None, True
-    except Exception as exc:             # noqa: BLE001
-        print("警告：查询任务列表失败（%s），改用离线模式。" % exc)
-        done, offline = None, True
-    for cat, lib in (("Movies", MOVIE_DIR), ("TV", TV_DIR), ("Private", PRIVATE_DIR),
-                     ("_unsorted", None)):
-        src = os.path.join(STAGING, cat)
-        if not os.path.isdir(src):
-            continue
-        for entry in sorted(os.listdir(src)):
-            p = os.path.join(src, entry)
-            if entry.endswith((".aria2", ".aria2__temp")):
-                # 控制文件对应的数据文件已经入库 -> 这就是残留，清掉
-                base = entry[:-len(".aria2__temp")] if entry.endswith(".aria2__temp") \
-                    else entry[:-len(".aria2")]
-                gone = not os.path.exists(os.path.join(src, base))
-                if lib:
-                    gone = gone and not os.path.exists(os.path.join(lib, base))
-                if gone:
-                    try:
-                        os.remove(p)
-                        print("清理残留控制文件: %s" % p)
-                        cleaned += 1
-                    except OSError as exc:
-                        print("清理失败 %s: %s" % (p, exc))
-                continue
-            if entry.endswith(".torrent") or entry.startswith("[METADATA]"):
-                print("跳过 BT 元数据文件: %s" % p)
-                continue
-            target = lib
-            if target is None:
-                hit = TV_RE.search(entry)
-                looks = hit or entry.lower().endswith(VIDEO_EXT) or QUALITY_RE.search(entry)
-                if not looks:
-                    print("跳过（_unsorted 且判断不出电影/剧集）: %s" % p)
-                    continue
-                target = TV_DIR if hit else MOVIE_DIR
-            if done is not None and (src, entry) not in done:
-                print("跳过（aria2 未报告该条目数据完整：仍在下载/暂停，或任务结果已被清除）: %s" % p)
-                continue
-            bad = media_guard(p)
-            if bad:
-                print("跳过（%s）: %s" % (bad, p))
-                continue
-            dst = os.path.join(target, clean_name(entry))
-            if os.path.exists(dst):
-                dst = "%s.%d" % (dst, int(time.time()))
-            os.rename(p, dst)
-            print("已入库: %s -> %s" % (p, dst))
-            for old, new, why in clean_tree(dst):
-                print("  内部改名(%s): %s -> %s" % (why, old, new))
-            moved += 1
-    print("共移动 %d 个条目，清理 %d 个残留控制文件" % (moved, cleaned))
 
 
 # =====================================================================
@@ -579,7 +347,7 @@ def sweep(_args=None):
 # ---------------------------------------------------------------------
 # 本脚本不内置任何种子站/索引站：a2 find 调用你在 a2.conf 里配置的「搜索源命令」
 # （tor-source-cmd=，环境变量 A2_TOR_CMD 可临时覆盖），源命令负责请求、解析、翻页，
-# 把结果以 JSON 打到 stdout；a2 负责过滤、排序、缓存、元数据校验与入库。
+# 把结果以 JSON 打到 stdout；a2 负责过滤、排序、缓存与元数据校验（落点仍由 --dir 给）。
 #   完整契约、字段别名与示例：references/tor-source.md
 #   scripts/tor-source-demo.py      —— 离线自测源（不联网，用来验证 find/grab 的流程）
 #   scripts/tor-source-template.py  —— 接入自己站点的骨架（填 URL 与解析即可）
@@ -690,7 +458,7 @@ def tor_int(val, default=0):
 
 
 def tor_cat_of(title, raw_cat):
-    """分类字符串归一：源给了就按源的；源没给就按标题猜（与 a2 add 的路由规则同一套正则）。"""
+    """分类字符串归一：源给了就按源的；源没给就按标题猜（与 find 的默认过滤同一套正则）。"""
     c = (raw_cat or "").strip().lower()
     if c.startswith("movie"):
         return "Movies"
@@ -906,7 +674,7 @@ def cmd_find(args):
     for i, r in enumerate(rows, 1):
         print("%-3d %-5d %-5d %8s  %-15s %s" % (i, r["seeds"], r["leech"], r["size"],
                                                 r["cat"][:15], r["title"][:96]))
-    print("\n共 %d 条（源 %s，原始 %d 条%s）。入库: a2 grab <序号>   （多个用逗号: a2 grab 1,3,5）"
+    print("\n共 %d 条（源 %s，原始 %d 条%s）。下载: a2 grab <序号> --dir <目录>   （多个用逗号: a2 grab 1,3,5）"
           % (len(rows), src_id, len(raw), "，%d 页" % pages if pages > 1 else ""))
     print("没看到想要的？--pages N 多翻几页（源若不分页会自动停）；--all 放宽到全部分类；"
           "搜不到就调整搜索源本身（见 references/tor-source.md）。")
@@ -921,7 +689,7 @@ def tor_magnet_of(row):
     ih = (row.get("ih") or "").strip()
     if re.fullmatch(r"[0-9a-fA-F]{32}|[0-9a-fA-F]{40}", ih):
         return tor_magnet(ih.lower(), row.get("title") or "")
-    sys.exit("这一行既没有磁力也没有 infohash，无法入库：%s\n"
+    sys.exit("这一行既没有磁力也没有 infohash，无法下载：%s\n"
              "  数据来自你自己的搜索源，请检查它输出的字段（契约见 references/tor-source.md）。"
              % row.get("title"))
 
@@ -957,7 +725,7 @@ def tor_verify(magnet, timeout=None):
     两个坑写在这里，别改回去：
       1) 这种模式下 RPC 的 bittorrent.info.name 是 None、totalLength 只有几十 KB（那是 [METADATA] 本身），
          真实文件列表只能解析落盘的 <infohash>.torrent；
-      2) 校验任务照样占一个下载槽（conf 默认 max-concurrent-downloads=3），dir 必须是非 .incoming 目录。
+      2) 校验任务照样占一个下载槽（conf 默认 max-concurrent-downloads=3），dir 用专用临时目录。
     返回 {name, bytes, files, has_extras} 或 None（拿不到/超时）。"""
     timeout = timeout or TOR_VERIFY_TIMEOUT
     if not os.path.isdir(TOR_CACHE_DIR):
@@ -1014,44 +782,45 @@ def tor_verify(magnet, timeout=None):
     return None
 
 
-def cmd_grab(args):
-    if args and args[0] in ("-h", "--help", "help"):
-        print("""a2 grab —— 按搜索结果入库（默认先校验真做种）
-用法: a2 grab <序号|标题片段|infohash|磁力> [-t|-m|-P|-flat|-d 目录] [-p] [-o 文件名] [--no-verify]
+GRAB_USAGE = """a2 grab —— 按搜索结果下载（默认先校验真做种）
+用法: a2 grab <序号|标题片段|infohash|磁力> --dir DIR [-p] [-o 文件名] [--no-verify]
   序号      最近一次 `a2 find` 视图里的序号，支持多个/区间: a2 grab 1,3,5 / a2 grab 2-4
   标题片段  命中标题或详情页 URL 子串（含空格时加引号）
   infohash  32/40 位；缓存里有现成磁力就用现成的，没有就自己拼
   磁力      完整 magnet: 链接，不走缓存
-  -t/-m/-P  强制分类（剧集/电影/私藏）    -flat 落默认下载目录    -d DIR 直达指定目录
+  --dir DIR 必填：下到这里（a2 不做分类/改名/入库，落点由 skill 决定）
   -p        加入后暂停    -o 文件名 指定保存名
   --no-verify  跳过 bt-metadata-only 真做种校验（源标的做种数可能撒谎）
 
-序号取的是最近一次 find 的视图（过滤+排序后），并在 ~/.aria2/find-cache.json 里缓存 15 分钟。""")
+序号取的是最近一次 find 的视图（过滤+排序后），并在 ~/.aria2/find-cache.json 里缓存 15 分钟。"""
+
+
+def cmd_grab(args):
+    if args and args[0] in ("-h", "--help", "help"):
+        print(GRAB_USAGE)
         return 0
-    verify, force, out, pause, dir_out, targets = True, None, None, False, None, []
+    verify, out, pause, dir_out, targets = True, None, False, None, []
     while args:
         a, args = args[0], args[1:]
         if a == "--no-verify":
             verify = False
-        elif a in ("-t", "--tv"):
-            force = "tv"
-        elif a in ("-m", "--movie"):
-            force = "movie"
-        elif a in ("-P", "--private"):
-            force = "private"
-        elif a in ("-d", "--dir") and args:
+        elif a == "--dir" and args:
             dir_out = args.pop(0)
-        elif a in ("-flat", "--flat"):
-            force = "flat"
         elif a in ("-p", "--pause"):
             pause = True
         elif a in ("-o", "--out") and args:
             out = args.pop(0)
+        elif a in REMOVED_FLAGS:
+            sys.exit("已移除的选项: %s\n"
+                     "  落点只由 --dir 决定，分类（电影/剧集/私藏）与入库由 skill 决定。" % a)
         else:
             targets.append(a)
     if not targets:
-        sys.exit("用法: a2 grab <序号|标题片段|infohash|磁力> [-t|-m|-P|-flat|-d 目录] "
-                 "[-p] [-o 名字] [--no-verify]")
+        sys.exit(GRAB_USAGE)
+    if not dir_out:
+        sys.exit("缺少目标目录：a2 grab ... --dir <目录>\n"
+                 "  a2 不推断落点；默认下载目录见 a2-dest。")
+    resolve_dir(dir_out)          # 提前校验/创建：不要在校验完元数据之后才发现目录不可用
 
     # 序号支持 “1,3,5” 和 “2-4”
     picks = []
@@ -1094,33 +863,22 @@ def cmd_grab(args):
                   % (row["title"], row["size"], row["cat"], row.get("src") or "搜索源", row["seeds"]))
             magnet = tor_magnet_of(row)
         print("   磁力: %s" % magnet)
-        # 分类用条目标题（校验拿到的真实名称优先）：磁力里的 dn= 常被源简写，
-        # 只看 dn 会把整季包当成普通下载（落 conf 的 dir，不入媒体库）。
-        hint = (row or {}).get("title")
-        if force is None and row:
-            # 用户没显式指定 -m/-t 时，跟随搜索结果那一行的分类（源的分类，或由标题推断的分类）
-            force = {"tv": "tv", "movie": "movie"}.get((row.get("cat") or "").strip().lower())
         if verify:
             print("   校验中（bt-metadata-only，最多 %ds）…" % TOR_VERIFY_TIMEOUT)
             info = tor_verify(magnet)
             if not info:
-                print("   × 未入库：拿不到元数据。多半是真没人做种（或磁力已失效），"
-                      "可用 --no-verify 强行入库、或换一条。")
+                print("   × 未下载：拿不到元数据。多半是真没人做种（或磁力已失效），"
+                      "可用 --no-verify 强行下载、或换一条。")
                 continue
             print("   ✓ 元数据到手: %s" % info["name"])
             print("     %d 个文件 / %.2f GB%s" % (info["files"], info["bytes"] / 1e9,
                                                  "（含花絮 Featurettes）" if info["has_extras"] else ""))
-            hint = info["name"]
-        flags = []
-        if force:
-            flags.append({"tv": "-t", "movie": "-m", "private": "-P", "flat": "-flat"}[force])
-        if dir_out:
-            flags += ["-d", dir_out]
+        flags = ["--dir", dir_out]
         if pause:
             flags.append("-p")
         if out:
             flags += ["-o", out]
-        cmd_add(flags + [magnet], name_hint=hint)
+        cmd_add(flags + [magnet])
     return 0
 
 
@@ -1132,15 +890,13 @@ def main(argv):
     if cmd in ("-h", "--help", "help"):
         print(__doc__)
         return 0
-    if cmd not in ("add", "sweep", "find", "grab", "ls", "list", "st", "info", "files", "pause",
+    if cmd not in ("add", "find", "grab", "ls", "list", "st", "info", "files", "pause",
                    "unpause", "resume", "rm", "purge", "up", "down"):
-        # 允许省略 add：`a2 -m <magnet>`、`a2 <url>`、`a2 -p <链接>` 都当成 add
+        # 允许省略 add：`a2 --dir D <magnet>`、`a2 <url>`、`a2 -p <链接>` 都当成 add
         args, cmd = argv[1:], "add"
 
     if cmd == "add":
         cmd_add(args)
-    elif cmd == "sweep":
-        sweep()
     elif cmd == "find":
         return cmd_find(args)
     elif cmd == "grab":

@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""a2-dest —— 下载落点配置（skill 层：a2 本身只认 --dir，不做任何落点推断）
+
+首次运行按当前 OS 生成默认下载目录并写入配置文件；之后「读默认值 / 改默认值」都走这个文件。
+「电影 / 剧集 / 私藏」这类分类子目录由 skill 用这里给出的根目录自行拼接，a2 不认识分类。
+
+配置: ~/.aria2/dest.conf（A2_DEST_CONF 可换路径）
+  download-dir=<默认下载目录>
+  media-root=<媒体库根，可选；未设置时等于 download-dir>
+
+用法:
+  a2-dest                 打印默认下载目录（首次自动按 OS 初始化并持久化）
+  a2-dest set DIR         设置默认下载目录（持久化，后续下载沿用）
+  a2-dest media           打印媒体库根（未设置 → 同 download-dir）
+  a2-dest media set DIR   设置媒体库根
+  a2-dest cat             打印配置文件路径与内容
+  a2-dest --json          机器可读: {"config":…,"download-dir":…,"media-root":…}
+"""
+import json
+import os
+import sys
+
+CONF = os.path.expanduser(os.environ.get("A2_DEST_CONF", "~/.aria2/dest.conf"))
+
+
+def default_download_dir():
+    """当前 OS 的用户下载目录（macOS / Linux / Windows）。"""
+    home = os.path.expanduser("~")
+    if os.name == "nt":                                  # Windows: %USERPROFILE%\\Downloads
+        return os.path.join(os.environ.get("USERPROFILE") or home, "Downloads")
+    if sys.platform == "darwin":                         # macOS: ~/Downloads
+        return os.path.join(home, "Downloads")
+    # Linux/BSD：优先 XDG 用户目录（本地化后可能叫 ~/下载），再退回 ~/Downloads
+    xdg = os.environ.get("XDG_DOWNLOAD_DIR")
+    if xdg:
+        return os.path.abspath(os.path.expanduser(xdg.replace("$HOME", home)))
+    cfg = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config"),
+                       "user-dirs.dirs")
+    try:
+        with open(cfg) as fh:
+            for line in fh:
+                line = line.strip()
+                if line.startswith("XDG_DOWNLOAD_DIR="):
+                    val = line.split("=", 1)[1].strip().strip('"').replace("$HOME", home)
+                    if val and os.path.isdir(val):
+                        return os.path.abspath(val)
+    except OSError:
+        pass
+    return os.path.join(home, "Downloads")
+
+
+def read_conf():
+    """读配置；文件不存在时按 OS 生成默认值并落盘（首次使用即持久化）。"""
+    data, created = {}, False
+    try:
+        with open(CONF) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                data[k.strip()] = v.strip()
+    except OSError:
+        data = {}
+    if not data.get("download-dir"):
+        data["download-dir"] = default_download_dir()
+        write_conf(data)
+        created = True
+    if not data.get("media-root"):
+        data["media-root"] = data["download-dir"]
+    return data, created
+
+
+def write_conf(data):
+    d = os.path.dirname(CONF)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    lines = ["# a2-dest：下载落点配置（skill 层；a2 只认 --dir，不读这个文件）"]
+    for k in ("download-dir", "media-root"):
+        if data.get(k):
+            lines.append("%s=%s" % (k, data[k]))
+    with open(CONF, "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+
+def abs_dir(val):
+    return os.path.abspath(os.path.expanduser(val))
+
+
+def set_dir(key, val):
+    """持久化一个目录。目录不存在就建（建不了直接报错，不静默）。"""
+    p = abs_dir(val)
+    try:
+        os.makedirs(p, exist_ok=True)
+    except OSError as exc:
+        sys.exit("目录不可用: %s (%s)" % (p, exc))
+    data, _ = read_conf()
+    data[key] = p
+    write_conf(data)
+    return p
+
+
+USAGE = __doc__
+
+
+def main(argv):
+    args = argv[1:]
+    if args and args[0] in ("-h", "--help", "help"):
+        print(USAGE.strip())
+        return 0
+    data, created = read_conf()
+    if created:
+        sys.stderr.write("已生成 %s（默认下载目录 %s）\n" % (CONF, data["download-dir"]))
+
+    if not args:
+        print(data["download-dir"])
+    elif args[0] == "--json":
+        print(json.dumps({"config": CONF, "download-dir": data["download-dir"],
+                          "media-root": data["media-root"]}, ensure_ascii=False))
+    elif args[0] == "cat":
+        print("# %s" % CONF)
+        try:
+            sys.stdout.write(open(CONF).read())
+        except OSError as exc:
+            sys.exit("读不到配置: %s (%s)" % (CONF, exc))
+    elif args[0] == "set" and len(args) > 1:
+        print(set_dir("download-dir", args[1]))
+    elif args[0] == "media":
+        if len(args) > 2 and args[1] == "set":
+            print(set_dir("media-root", args[2]))
+        else:
+            print(data["media-root"])
+    else:
+        sys.stderr.write("无法识别的参数: %s\n\n%s\n" % (" ".join(args), USAGE.strip()))
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

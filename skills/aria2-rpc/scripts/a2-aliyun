@@ -5,7 +5,7 @@
 ALIST_URL="http://localhost:5244"
 ALIST_USER="admin"
 PASSWORD_FILE="$HOME/.alist/admin_password.txt"
-DEFAULT_OUTPUT="${A2_DOWNLOAD_DIR:-$HOME/Downloads}"
+DEFAULT_OUTPUT="${A2_DOWNLOAD_DIR:-$(a2-dest 2>/dev/null || echo "$HOME/Downloads")}"
 
 # 读取密码（优先密码文件，与 a2-ls/a2-alist 一致；避免把凭据写死在脚本里）
 if [ -f "$PASSWORD_FILE" ]; then
@@ -18,7 +18,7 @@ fi
 if [ -z "$1" ]; then
     echo "用法: $0 \"AList中的文件路径\" [输出目录]"
     echo "示例: $0 \"/aliyun/长安的荔枝/05 4K.mp4\""
-    echo "示例: $0 \"/aliyun/长安的荔枝/05 4K.mp4\" ${A2_MEDIA_ROOT:-$HOME/media}/TV"
+    echo "示例: $0 \"/aliyun/长安的荔枝/05 4K.mp4\" $(a2-dest media)/TV"
     exit 1
 fi
 
@@ -69,7 +69,7 @@ echo ""
 
 # 用 a2 下载
 echo "正在添加到 a2 下载队列..."
-a2 add -o "$OUTPUT_DIR" "$RAW_URL"
+a2 add --dir "$OUTPUT_DIR" "$RAW_URL"
 
 echo ""
 echo "下载任务已添加！用 'a2 list' 查看进度"
