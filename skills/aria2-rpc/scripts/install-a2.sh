@@ -54,7 +54,8 @@ install -m 755 "$SKILL_DIR/scripts/a2"             "$ARIA2_DIR/a2"
 install -m 755 "$SKILL_DIR/scripts/start-aria2.sh" "$ARIA2_DIR/start-aria2.sh"
 install -m 755 "$SKILL_DIR/scripts/a2-dest"        "$BIN_DIR/a2-dest"
 install -m 755 "$SKILL_DIR/scripts/a2-search"      "$BIN_DIR/a2-search"
-echo "已安装核心脚本 -> $ARIA2_DIR/{a2,start-aria2.sh} + $BIN_DIR/{a2-dest,a2-search}"
+install -m 755 "$SKILL_DIR/scripts/a2-verify"      "$BIN_DIR/a2-verify"
+echo "已安装核心脚本 -> $ARIA2_DIR/{a2,start-aria2.sh} + $BIN_DIR/{a2-dest,a2-search,a2-verify}"
 # 落点配置：首次运行按 OS 生成默认下载目录（已存在则沿用，不覆盖用户改过的值）
 "$BIN_DIR/a2-dest" >/dev/null
 echo "默认下载目录 -> $("$BIN_DIR/a2-dest")（改：a2-dest set <目录>）"
@@ -163,11 +164,11 @@ curl -s -o /dev/null -w "AList  http:%{http_code}\n" http://localhost:5244 --max
 a2 st 2>/dev/null || echo "RPC 未就绪：确认守护进程在跑（macOS: launchctl print gui/$(id -u)/${SERVICE}｜Linux: systemctl --user status ${SERVICE}），并检查 $ARIA2_DIR/aria2.conf"
 cat <<EOF
 == 完成。常用命令：
-     a2 st / a2 ls / a2-dest / a2-dest set <目录>
-     a2 add --dir "$(${BIN_DIR}/a2-dest)" "<磁力或链接>"      # 落点必须显式给
+     a2 st / a2 ls / a2 concurrent / a2-dest / a2-search
+     DEST=$(${BIN_DIR}/a2-dest check "$(${BIN_DIR}/a2-dest)"); a2 add --dir "$DEST" "<磁力或链接>"
    搜索在 skill 层（a2 不内置任何站点）：先在 $ARIA2_DIR/search-sites.conf 里加
      site=<名字>|<URL 模板>          或   site=<名字>|cmd:<命令>
-   然后 a2-search <关键词> → a2 add --dir <目录> --verify "<磁力>"。
+   然后 a2-search <关键词> → a2-verify "<磁力>" → a2-dest check <目录> → a2 add --dir <目录> "<磁力>"。
    想先跑通流程（离线、不联网）：site=本地演示|cmd:python3 $ARIA2_DIR/search-source-demo.py
    契约与示例见 references/search-sites.md。
    服务名是 ${SERVICE}；想换：A2_SERVICE=a2.其他名字 bash scripts/install-a2.sh

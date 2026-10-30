@@ -10,6 +10,7 @@ import contextlib
 import importlib.machinery
 import importlib.util
 import io
+import json
 import os
 import shutil
 import sys
@@ -33,10 +34,13 @@ class DestTests(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix="a2dest-")
         self.conf = os.path.join(self.tmp, "dest.conf")
         os.environ["A2_DEST_CONF"] = self.conf
+        # 夹具目录在 /var/folders（家目录之外、系统盘）：默认会被落点策略拒绝，测试里放行
+        os.environ["A2_ALLOW_CREATE"] = "1"
         self.mod = load_script("a2dest_under_test", DEST)
 
     def tearDown(self):
         os.environ.pop("A2_DEST_CONF", None)
+        os.environ.pop("A2_ALLOW_CREATE", None)
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def run_cli(self, *args):
@@ -86,6 +90,63 @@ class DestTests(unittest.TestCase):
         self.assertIn('"download-dir"', out)
         self.assertIn('"media-root"', out)
         self.assertIn(self.conf, out)
+
+    # ---- check：落点策略（原来压在 a2 里） ----
+    def test_check_creates_dir_with_allow_create(self):
+        os.environ["A2_ALLOW_CREATE"] = "1"
+        try:
+            target = os.path.join(self.tmp, "new", "sub")
+            rc, out, _ = self.run_cli("check", target)
+            self.assertEqual(rc, 0)
+            self.assertEqual(out, os.path.abspath(target))
+            self.assertTrue(os.path.isdir(target))
+        finally:
+            os.environ.pop("A2_ALLOW_CREATE", None)
+
+    def test_check_refuses_system_disk_path(self):
+        # 不在家目录内、又会被建在系统盘上（外接盘没挂载的样子）——默认拒绝
+        os.environ.pop("A2_ALLOW_CREATE", None)
+        with self.assertRaises(SystemExit) as ctx:
+            self.run_cli("check", "/nonexistent-mount-point-xyz/media")
+        msg = str(ctx.exception)
+        self.assertIn("落点不可用", msg)
+        self.assertIn("A2_ALLOW_CREATE", msg)
+
+    def test_check_refuses_when_space_below_threshold(self):
+        os.environ["A2_ALLOW_CREATE"] = "1"
+        os.environ["A2_MIN_FREE_GB"] = str(10 ** 9)
+        try:
+            mod = load_script("a2dest_tight", DEST)       # 阈值在 import 时读入
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as ctx:
+                    mod.main(["a2-dest", "check", self.tmp])
+            self.assertIn("剩余空间不足", str(ctx.exception))
+        finally:
+            os.environ.pop("A2_MIN_FREE_GB", None)
+            os.environ.pop("A2_ALLOW_CREATE", None)
+
+    def test_check_json(self):
+        os.environ["A2_ALLOW_CREATE"] = "1"
+        try:
+            rc, out, _ = self.run_cli("check", self.tmp, "--json")
+            self.assertEqual(rc, 0)
+            payload = json.loads(out)
+            self.assertEqual(payload["dir"], os.path.abspath(self.tmp))
+            self.assertIn("free_gb", payload)
+        finally:
+            os.environ.pop("A2_ALLOW_CREATE", None)
+
+    def test_set_uses_check(self):
+        os.environ["A2_ALLOW_CREATE"] = "1"
+        try:
+            target = os.path.join(self.tmp, "dl2")
+            rc, out, _ = self.run_cli("set", target)
+            self.assertEqual(rc, 0)
+            self.assertTrue(os.path.isdir(target))
+            with open(self.conf) as fh:
+                self.assertIn("download-dir=%s" % os.path.abspath(target), fh.read())
+        finally:
+            os.environ.pop("A2_ALLOW_CREATE", None)
 
     def test_unknown_arg(self):
         rc, _out, err = self.run_cli("bogus")

@@ -1,26 +1,35 @@
 #!/usr/bin/env python3
-"""a2-dest —— 下载落点配置（skill 层：a2 本身只认 --dir，不做任何落点推断）
+"""a2-dest —— 落点配置与落点检查（skill 层：a2 只认 --dir，不做任何落点推断/策略）
 
-首次运行按当前 OS 生成默认下载目录并写入配置文件；之后「读默认值 / 改默认值」都走这个文件。
-「电影 / 剧集 / 私藏」这类分类子目录由 skill 用这里给出的根目录自行拼接，a2 不认识分类。
+三件事，全在技能这一层：
+  ① 默认目录：首次运行按当前 OS 生成并写入配置，之后读/改都走这个文件；
+  ② 分类根目录：`media` 给出媒体库根，「电影/剧集/私藏」这类子目录由技能自己拼；
+  ③ 落点检查（check）：盘在不在（外接盘有没有挂载）、能不能建、剩余空间够不够 ——
+     这套策略原来压在 a2 里，现在归 skill；a2 只要求目录存在。
 
 配置: ~/.aria2/dest.conf（A2_DEST_CONF 可换路径）
   download-dir=<默认下载目录>
   media-root=<媒体库根，可选；未设置时等于 download-dir>
 
+策略开关（环境变量）：
+  A2_MIN_FREE_GB=<n>   check 时要求的最低剩余空间（默认 20；0 = 不检查）
+  A2_ALLOW_CREATE=1    允许把不存在的目录建在系统盘上（默认拒绝：外接盘没挂载的典型误写）
+
 用法:
   a2-dest                 打印默认下载目录（首次自动按 OS 初始化并持久化）
-  a2-dest set DIR         设置默认下载目录（持久化，后续下载沿用）
+  a2-dest check DIR       检查并准备一个落点（建目录 + 空间检查），打印绝对路径
+  a2-dest --json          机器可读: {"config":…,"download-dir":…,"media-root":…}
+  a2-dest set DIR         设置默认下载目录（持久化，后续沿用）
   a2-dest media           打印媒体库根（未设置 → 同 download-dir）
   a2-dest media set DIR   设置媒体库根
   a2-dest cat             打印配置文件路径与内容
-  a2-dest --json          机器可读: {"config":…,"download-dir":…,"media-root":…}
 """
 import json
 import os
 import sys
 
 CONF = os.path.expanduser(os.environ.get("A2_DEST_CONF", "~/.aria2/dest.conf"))
+MIN_FREE_GB = float(os.environ.get("A2_MIN_FREE_GB", "20"))
 
 
 def default_download_dir():
@@ -75,7 +84,7 @@ def write_conf(data):
     d = os.path.dirname(CONF)
     if d:
         os.makedirs(d, exist_ok=True)
-    lines = ["# a2-dest：下载落点配置（skill 层；a2 只认 --dir，不读这个文件）"]
+    lines = ["# a2-dest：落点配置（skill 层；a2 只认 --dir，不读这个文件）"]
     for k in ("download-dir", "media-root"):
         if data.get(k):
             lines.append("%s=%s" % (k, data[k]))
@@ -87,13 +96,88 @@ def abs_dir(val):
     return os.path.abspath(os.path.expanduser(val))
 
 
-def set_dir(key, val):
-    """持久化一个目录。目录不存在就建（建不了直接报错，不静默）。"""
-    p = abs_dir(val)
+# ---------------------------------------------------------------- 落点策略（原来压在 a2 里）
+
+def _same_device(a, b):
+    """两个路径是否在同一存储设备上（POSIX 看 st_dev；Windows 上 st_dev 是卷标识）。"""
     try:
-        os.makedirs(p, exist_ok=True)
-    except OSError as exc:
-        sys.exit("目录不可用: %s (%s)" % (p, exc))
+        return os.stat(a).st_dev == os.stat(b).st_dev
+    except OSError:
+        return False
+
+
+def path_target_ok(path):
+    """目标路径当前能不能用。返回 (ok, 原因)。
+
+    放行：路径已存在（目录要求可写）；在家目录内；落在与家目录不同的存储设备上；
+         显式设了 A2_ALLOW_CREATE=1。
+    拒绝：路径不存在、又不在家目录内、还会被创建在家目录所在那块盘上 ——
+         这正是外接盘/网络盘没挂载、挂载点目录凭空消失的样子，继续下去会悄悄写满系统盘。
+    """
+    p = abs_dir(path)
+    if os.path.exists(p):
+        if not os.path.isdir(p):
+            return False, "%s 存在但不是目录" % p
+        if not os.access(p, os.W_OK):
+            return False, "%s 存在但不可写" % p
+        return True, ""
+    if os.environ.get("A2_ALLOW_CREATE") == "1":
+        return True, ""
+    home = abs_dir("~")
+    if p == home or p.startswith(home.rstrip(os.sep) + os.sep):
+        return True, ""                                  # 家目录内：系统盘也放行
+    anc = p
+    while not os.path.exists(anc):
+        parent = os.path.dirname(anc)
+        if not parent or parent == anc:
+            break
+        anc = parent
+    if not os.path.exists(anc):
+        return False, "%s 所在位置不可用（盘符/挂载点不存在）" % p
+    if not _same_device(anc, home):
+        return True, ""                                  # 落在别的盘上：放行
+    return False, "%s 不存在，且会被创建到系统盘上（外接盘/网络盘多半没挂载）" % p
+
+
+def free_gb(path):
+    """目标路径所在卷的可用空间（GB）。路径不存在时向上找已存在的父目录。"""
+    probe = abs_dir(path or ".")
+    while probe and not os.path.exists(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    try:
+        st = os.statvfs(probe or "/")
+    except OSError:
+        return None
+    return st.f_bavail * st.f_frsize / (1024.0 ** 3)
+
+
+def check_dir(path):
+    """校验并准备一个落点（建目录 + 空间检查），返回绝对路径；不可用时 sys.exit 说清原因。"""
+    if not path:
+        sys.exit("缺少目录：a2-dest check <目录>")
+    p = abs_dir(path)
+    ok, why = path_target_ok(p)
+    if not ok:
+        sys.exit("落点不可用：%s\n  ↓ %s\n  确认就该建在系统盘上：先 mkdir -p 它，或设 A2_ALLOW_CREATE=1。"
+                 % (p, why))
+    if not os.path.isdir(p):
+        try:
+            os.makedirs(p, exist_ok=True)
+        except OSError as exc:
+            sys.exit("建不了目录: %s (%s)" % (p, exc))
+    g = free_gb(p)
+    if g is not None and MIN_FREE_GB and g < MIN_FREE_GB:
+        sys.exit("剩余空间不足：%s 只剩 %.1f GB（阈值 %.0f GB，A2_MIN_FREE_GB 可调，0=不检查）。"
+                 % (p, g, MIN_FREE_GB))
+    return p
+
+
+def set_dir(key, val):
+    """持久化一个目录（先按落点策略校验/创建，避免把默认值存成一个挂不上的路径）。"""
+    p = check_dir(val)
     data, _ = read_conf()
     data[key] = p
     write_conf(data)
@@ -114,13 +198,26 @@ def main(argv):
 
     if not args:
         print(data["download-dir"])
+    elif args[0] == "check":
+        as_json = "--json" in args
+        target = [a for a in args[1:] if a != "--json"]
+        if not target:
+            sys.exit("用法: a2-dest check <目录> [--json]")
+        p = check_dir(target[0])
+        if as_json:
+            g = free_gb(p)
+            print(json.dumps({"dir": p, "free_gb": None if g is None else round(g, 1),
+                              "min_free_gb": MIN_FREE_GB}, ensure_ascii=False))
+        else:
+            print(p)
     elif args[0] == "--json":
         print(json.dumps({"config": CONF, "download-dir": data["download-dir"],
                           "media-root": data["media-root"]}, ensure_ascii=False))
     elif args[0] == "cat":
         print("# %s" % CONF)
         try:
-            sys.stdout.write(open(CONF).read())
+            with open(CONF) as fh:
+                sys.stdout.write(fh.read())
         except OSError as exc:
             sys.exit("读不到配置: %s (%s)" % (CONF, exc))
     elif args[0] == "set" and len(args) > 1:

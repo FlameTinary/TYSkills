@@ -2,35 +2,39 @@
 """a2 —— aria2 RPC 命令行封装（macOS / Linux / Windows 通用；配套 .sh 脚本在 Windows 上用 WSL 或 Git Bash）。
 端口与密钥自动从 ~/.aria2/aria2.conf 读取。
 
-a2 只做两件事：**下载到你给的目录**、**管理已有任务**。
-  · 落点：`--dir` 必填，a2 不推断分类、不改名、不搬动；
-  · 搜索：不在这里 —— 搜索是 skill 的事（`a2-search` + 你自己配置的站点 / agent 的全网检索），
-    a2 只负责把选好的磁力/链接下下来（可选用 `--verify` 先验真做种）。
+**a2 只对资源做增删改查**（不搜索、不决定落点/分类、不改名、不搬动、不判断资源好坏）：
+  增  把调用方给的链接/磁力/种子下到调用方给的目录
+  删  移除正在下载/等待中的任务；清空已结束任务列表
+  改  暂停/继续、改并发任务数、改上下行限速
+  查  任务列表（含已结束）、单任务详情、任务内文件
+
+搜索：`a2-search`（skill 层，站点自配，见 references/search-sites.md）
+落点：`a2-dest`（skill 层：默认目录 + check 落点/挂载/空间）
+资源好坏：`a2-verify`（skill 层：bt-metadata-only 验真做种）
 
 用法:
-  a2 add --dir DIR [--verify] [-p] [-o 文件名] <url|magnet|file.torrent|urls.txt> ...
-        --dir DIR   必填：下到 DIR（不存在则创建）
-        --verify    先做 bt-metadata-only 真做种校验，拿不到元数据就跳过该条
-        -p 加入后先暂停   -o 指定保存文件名
-  空间保护：目标盘剩余 < 20GB 时拒绝加任务（可用 A2_MIN_FREE_GB=5 临时放宽）
-  a2 ls [-a]            任务列表（默认活动+等待，-a 含已结束）
-  a2 st                 全局速率/任务数
-  a2 info <gid>         单任务详情
+  a2 add --dir DIR [-p] [-o 文件名] <url|magnet|file.torrent|urls.txt> ...
+        --dir DIR   必填：下到 DIR（**目录必须已存在**；用 a2-dest check 准备）
+        -p 加入后先暂停   -o 指定保存文件名（名字由调用方决定）
+  a2 ls [-a] [--name 片段]   任务列表（默认活动+等待；-a 含已结束；--name 按名字过滤）
+  a2 st                 全局速率/任务数（含并发上限）
+  a2 info <gid>         单任务详情（含保存目录与文件列表）
   a2 files <gid>        任务内文件列表
   a2 pause [force] <gid|all>   暂停（加 force = 立即中断当前分片）  a2 resume <gid|all>  继续
   a2 rm <gid|all>       移除任务（不删已下文件）  a2 purge  清空已结束列表
+  a2 concurrent [N]     查/改同时下载的任务数（不带参数=查看当前值）
   a2 up <rate|0>        上传限速（如 1M / 0=不限）  a2 down <rate|0>  下载限速
-
-搜索在 skill 层：`a2-search <关键词>`（站点配置见 ~/.aria2/search-sites.conf，契约见
-references/search-sites.md）；拿到磁力后 `a2 add --dir <目录> --verify "<磁力>"`。
-旧命令 `a2 find` / `a2 grab` 已移除，执行时会给出对应的新用法。
-gid 可用前 6 位以上的前缀；限速改动只在本次运行有效，持久化请改 conf 后重启守护。
+gid 可用前 6 位以上的前缀；concurrent / 限速改动只在本次运行有效，持久化请改 conf 后重启守护。
 """
-import base64, hashlib, json, os, re, sys, time
-import urllib.error, urllib.parse, urllib.request
+import base64
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
 
 CONF = os.path.expanduser(os.environ.get("A2_CONF", "~/.aria2/aria2.conf"))   # 测试/多实例可换
-# a2 自己的配置（搜索源、服务名…）。**不要把这些键写进 aria2.conf**：aria2 不认识的键会打
+# a2 自己的配置（服务名）。**不要把这些键写进 aria2.conf**：aria2 不认识的键会打
 # `[WARN] Unknown option: …`（无害但每次启动都刷屏），所以 a2 的专有配置单独放一个文件。
 RC = os.path.expanduser(os.environ.get("A2_RC", "~/.aria2/a2.conf"))
 
@@ -48,65 +52,13 @@ def key_get(path, key, default):
 
 
 def conf_get(key, default):
-    """读 aria2.conf（端口/密钥/下载目录这些 aria2 自己的选项）。"""
+    """读 aria2.conf（端口/密钥这些 aria2 自己的选项）。"""
     return key_get(CONF, key, default)
 
 
 def rc_get(key, default):
-    """读 a2.conf（a2 专有配置）。"""
+    """读 a2.conf（a2 专有配置：服务名）。"""
     return key_get(RC, key, default)
-
-# ---------- 跨平台小工具（macOS / Linux / Windows 通用，不做任何系统特有假设）----------
-
-def _same_device(a, b):
-    """两个路径是否在同一存储设备上（POSIX 看 st_dev；Windows 上 st_dev 是卷标识）。"""
-    try:
-        return os.stat(a).st_dev == os.stat(b).st_dev
-    except OSError:
-        return False
-
-
-def path_target_ok(path):
-    """目标路径当前能不能用。返回 (ok, 原因)。
-
-    放行：
-      - 路径已存在（是目录时要求可写）；
-      - 路径在**家目录内**（把媒体库放系统盘上是正常选择）；
-      - 路径落在与家目录**不同的存储设备**上（外接盘/网络盘/另一个分区，OK）；
-      - 显式设了 A2_ALLOW_CREATE=1。
-    拒绝：
-      - 路径不存在、又既不在家目录内、还会被创建在**家目录所在的那块盘**上 ——
-        这正是外接盘/网络盘没挂载时挂载点目录消失的样子（例：/mnt/usb/media、D:\media、
-        以及任意"挂载点凭空消失"的场景），继续下去会把几十 GB 悄悄写进系统盘。
-
-    判据只用 st_dev 与家目录比较（POSIX 与 Windows 都成立），不写死任何平台的挂载点前缀。
-    """
-    p = os.path.abspath(os.path.expanduser(path))
-    if os.path.exists(p):
-        if os.path.isdir(p) and not os.access(p, os.W_OK):
-            return False, "%s 存在但不可写" % p
-        return True, ""
-    if os.environ.get("A2_ALLOW_CREATE") == "1":
-        return True, ""
-    home = os.path.abspath(os.path.expanduser("~"))
-    if p == home or p.startswith(home.rstrip(os.sep) + os.sep):
-        return True, ""                                     # 家目录内：系统盘也放行
-    anc = p
-    while not os.path.exists(anc):
-        parent = os.path.dirname(anc)
-        if not parent or parent == anc:
-            break
-        anc = parent
-    if not os.path.exists(anc):
-        return False, "%s 所在位置不可用（盘符/挂载点不存在）" % p
-    if not _same_device(anc, home):
-        return True, ""                                     # 落在别的盘上：放行
-    return False, ("%s 不存在，且会被创建到系统盘上（外接盘/网络盘多半没挂载）" % p)
-
-HINT_CREATE = ("若该路径本来就该建在系统盘上：先 mkdir -p 它，或设 A2_ALLOW_CREATE=1 再试。")
-
-
-LAST_PATH_REASON = [""]
 
 
 PORT = conf_get("rpc-listen-port", "6800")
@@ -114,6 +66,9 @@ SECRET = os.environ.get("A2_SECRET") or conf_get("rpc-secret", "")
 URL = "http://127.0.0.1:%s/jsonrpc" % PORT
 # 服务名：只用于提示信息；与 install-a2.sh 的 A2_SERVICE / a2.conf 的 service= 保持一致
 SERVICE = os.environ.get("A2_SERVICE") or rc_get("service", "com.example.aria2")
+
+# 已删除的落点参数：命中时给出明确的迁移提示，而不是含糊的「无法识别」
+REMOVED_FLAGS = ("-m", "--movie", "-t", "--tv", "-P", "--private", "-flat", "--flat", "-d")
 
 
 def service_restart_hint():
@@ -132,63 +87,23 @@ def service_status_hint():
         return "schtasks /Query /TN %s /V" % SERVICE
     return "systemctl --user status %s" % SERVICE
 
-MIN_FREE_GB = float(os.environ.get("A2_MIN_FREE_GB", "20"))   # 目标盘最低余量，低于则拒绝加任务
-# 已删除的落点参数：命中时给出明确的迁移提示，而不是含糊的「无法识别」
-REMOVED_FLAGS = ("-m", "--movie", "-t", "--tv", "-P", "--private", "-flat", "--flat", "-d")
 
+def require_dir(dest):
+    """把调用方给的目录变成 aria2 的 dir。**必填，且必须已存在**。
 
-def free_gb(path):
-    """目标路径所在卷的可用空间（GB）。路径不存在时向上找已存在的父目录。"""
-    probe = os.path.abspath(path or ".")
-    while probe and not os.path.exists(probe):
-        parent = os.path.dirname(probe)
-        if parent == probe:
-            break
-        probe = parent
-    try:
-        st = os.statvfs(probe or "/")
-    except OSError:
-        return None
-    return st.f_bavail * st.f_frsize / (1024.0 ** 3)
-
-
-def ensure_space(path):
-    """空间不足直接中止 —— 磁盘写满会让 aria2 卡在内核调用里假死（见 skill 排错表）。"""
-    g = free_gb(path)
-    if g is None:
-        return None
-    if g < MIN_FREE_GB:
-        sys.exit("目标盘剩余空间不足：%s 只剩 %.1f GB（阈值 %.0f GB）。\n"
-                 "先清理空间，或临时用 A2_MIN_FREE_GB=5 a2 add ... 放宽。" % (path, g, MIN_FREE_GB))
-    return g
-
-
-def volume_ok(path):
-    """目标盘当前可用吗（跨平台）：目录存在可写，或能创建在非系统盘上。见 path_target_ok。"""
-    ok, why = path_target_ok(path)
-    if not ok:
-        LAST_PATH_REASON[0] = why
-    return ok
-
-
-def resolve_dir(dest):
-    """把调用方给的目录变成 aria2 的 dir。**必填**：a2 不推断任何落点。
-
-    a2 只做「能不能下到这里」的检查（盘在不在、能不能写），不分类、不改名、不搬动 ——
-    落点决策属于调用方（skill 用 a2-dest 给出默认目录与分类子目录）。
+    a2 不建目录、不判断盘挂没挂载、不算剩余空间、不分类 —— 那些都是 skill 的事
+    （`a2-dest check DIR` 负责建目录/挂载判据/空间阈值）。a2 只挡住「给了个不存在的目录」，
+    免得 aria2 把文件下到一个谁都没准备的位置。
     """
     if not dest:
         sys.exit("缺少目标目录：a2 add --dir <目录> <输入>\n"
-                 "  a2 只下到你显式指定的目录，不推断分类/默认库路径。\n"
-                 "  默认下载目录见 a2-dest（首次按 OS 生成并持久化）。")
+                 "  下载位置由调用方决定（默认目录见 a2-dest，落点检查用 a2-dest check）。")
     p = os.path.abspath(os.path.expanduser(dest))
-    if not volume_ok(p):
-        sys.exit("指定目录当前不可用：%s\n    ↓ %s\n    %s" % (p, LAST_PATH_REASON[0], HINT_CREATE))
-    try:
-        os.makedirs(p, exist_ok=True)
-    except OSError as exc:
-        sys.exit("指定目录不可用: %s (%s)" % (p, exc))
+    if not os.path.isdir(p):
+        sys.exit("目录不存在：%s\n  先用 a2-dest check %s 准备落点（建目录 + 挂载/空间检查）。"
+                 % (p, p))
     return p
+
 
 def rpc(method, params=None):
     body = json.dumps({"jsonrpc": "2.0", "id": "a2", "method": method,
@@ -258,46 +173,31 @@ def row(t):
         human(t.get("downloadSpeed", 0)) + "/s", name_of(t))
 
 
-ADD_USAGE = """a2 add —— 下载到你指定的目录（a2 不决定落点）
-用法: a2 add --dir DIR [--verify] [-p] [-o 文件名] <url|magnet|file.torrent|urls.txt> ...
-  --dir DIR      必填：下到 DIR（不存在则创建；只下载，不改名、不搬动）
-  --verify       先做 bt-metadata-only 真做种校验（磁力/种子），拿不到元数据就跳过该条
+ADD_USAGE = """a2 add —— 下载到你指定的目录（a2 不决定落点、不判断资源好坏）
+用法: a2 add --dir DIR [-p] [-o 文件名] <url|magnet|file.torrent|urls.txt> ...
+  --dir DIR      必填：下到 DIR（**目录必须已存在**；先用 a2-dest check DIR 准备落点）
   -p / --pause   加入后先暂停
-  -o / --out 名字 指定保存文件名
+  -o / --out 名字 指定保存文件名（名字由调用方/skill 决定）
 输入形式：URL、磁力、本地 .torrent、文本文件（每行一个链接，# 注释）
-落点：只由 --dir 决定。默认目录与子目录分类由 skill 负责（见 a2-dest）。
-搜索：不在这里 —— 用 skill 层的 a2-search（站点配置见 references/search-sites.md）。
-空间保护：目标盘剩余 < A2_MIN_FREE_GB（默认 20GB）时拒绝加任务。"""
-
-
-def precheck(magnet):
-    """--verify 的单条校验：拿不到元数据就跳过（返回 False）。"""
-    print("   校验中（bt-metadata-only，最多 %ds）…" % VERIFY_TIMEOUT)
-    info = verify_magnet(magnet)
-    if not info:
-        print("   × 跳过：拿不到元数据（多半没人做种）。不想等校验就别加 --verify。")
-        return False
-    print("   ✓ 元数据到手: %s ｜ %d 个文件 / %.2f GB%s" % (
-        info["name"], info["files"], info["bytes"] / 1e9,
-        "（含花絮）" if info["has_extras"] else ""))
-    return True
+落点：只由 --dir 决定；默认目录、分类子目录、挂载与空间检查都在 a2-dest（skill 层）。
+搜索：a2-search；资源好坏：a2-verify（bt-metadata-only 验真做种，也在 skill 层）。"""
 
 
 def cmd_add(args):
     if args and args[0] in ("-h", "--help", "help"):
         print(ADD_USAGE)
         return 0
-    opts, out, dest, verify = {}, None, None, False
+    opts, out, dest = {}, None, None
     while args and args[0].startswith("-"):
         flag, args = args[0], args[1:]
-        if flag == "--verify":
-            verify = True
-        elif flag in ("-p", "--pause"):
+        if flag in ("-p", "--pause"):
             opts["pause"] = "true"
         elif flag == "--dir" and args:
             dest, args = args[0], args[1:]
         elif flag in ("-o", "--out") and args:
             out, args = args[0], args[1:]
+        elif flag == "--verify":
+            sys.exit("--verify 已移到 skill 层：先用 `a2-verify <磁力>` 校验，再 a2 add。")
         elif flag in REMOVED_FLAGS:
             sys.exit("已移除的选项: %s\n"
                      "  a2 不再决定落点：只用 --dir <目录> 指下到哪，"
@@ -307,11 +207,8 @@ def cmd_add(args):
     if not args:
         sys.exit("缺少下载目标\n" + ADD_USAGE)
 
-    dest = resolve_dir(dest)
+    dest = require_dir(dest)
     note = "→ %s" % dest
-    g = ensure_space(dest)
-    if g is not None:
-        note += "（目标盘剩余 %.0f GB）" % g
 
     for a in args:
         o = dict(opts)
@@ -319,16 +216,10 @@ def cmd_add(args):
             o["out"] = out
         o["dir"] = dest
         if a.startswith(("http://", "https://", "ftp://", "magnet:", "sftp://")):
-            if verify and a.startswith("magnet:") and not precheck(a):
-                continue
             print("+ %s  %s\n    %s" % (rpc("aria2.addUri", [[a], o]), a, note))
         elif a.endswith(".torrent") and os.path.exists(a):
             with open(a, "rb") as fh:
                 blob = fh.read()
-            if verify:
-                mag = magnet_of(blob)
-                if mag and not precheck(mag):
-                    continue
             gid = rpc("aria2.addTorrent", [base64.b64encode(blob).decode(), [], o])
             print("+ %s  %s\n    %s" % (gid, a, note))
         elif a.endswith(".txt") and os.path.exists(a):
@@ -340,137 +231,48 @@ def cmd_add(args):
             print("跳过无法识别的内容: %s" % a)
 
 
-
-# =====================================================================
-# 真做种校验（bt-metadata-only）—— a2 add --verify 用
-# ---------------------------------------------------------------------
-# 磁力里的 dn= 和搜索结果页标的做种数都会撒谎：先用 bt-metadata-only 从 DHT 拉真实元数据，
-# 拉得到才算「真有人在做种」。校验是**下载控制**（占一个下载槽、要临时目录），不是搜索，
-# 所以留在 a2 里；搜索在 skill 层的 a2-search。
-# =====================================================================
-VERIFY_TIMEOUT = int(os.environ.get("A2_VERIFY_TIMEOUT", "90"))
-VERIFY_DIR = os.path.expanduser(os.environ.get("A2_VERIFY_DIR", "~/.aria2/tor-cache"))
-
-
-def _bdecode_at(data, i):
-    """bencode 解析，返回 (值, 下一个位置)。只为了读 .torrent 的 info 段。"""
-    c = data[i:i + 1]
-    if c == b"i":
-        j = data.index(b"e", i)
-        return int(data[i + 1:j]), j + 1
-    if c == b"l":
-        i, out = i + 1, []
-        while data[i:i + 1] != b"e":
-            v, i = _bdecode_at(data, i)
-            out.append(v)
-        return out, i + 1
-    if c == b"d":
-        i, out = i + 1, {}
-        while data[i:i + 1] != b"e":
-            k, i = _bdecode_at(data, i)
-            v, i = _bdecode_at(data, i)
-            out[k] = v
-        return out, i + 1
-    j = data.index(b":", i)
-    n = int(data[i:j])
-    return data[j + 1:j + 1 + n], j + 1 + n
+def cmd_ls(args):
+    show_all, pattern = False, None
+    while args:
+        a, args = args[0], args[1:]
+        if a in ("-a", "--all"):
+            show_all = True
+        elif a == "--name" and args:
+            pattern = args.pop(0).lower()
+        else:
+            sys.exit("用法: a2 ls [-a] [--name 片段]")
+    stopped = rpc("aria2.tellStopped", [0, 1000])
+    groups = [("活动", rpc("aria2.tellActive")),
+              ("等待", rpc("aria2.tellWaiting", [0, 1000]))]
+    if show_all:
+        groups.append(("已结束", stopped))
+    shown = 0
+    for title, tasks in groups:
+        if pattern:
+            tasks = [t for t in tasks if pattern in name_of(t).lower()]
+        if tasks:
+            print("== %s ==" % title)
+            for t in tasks:
+                print(row(t))
+                shown += 1
+    if pattern and not shown:
+        print("没有名字包含 %r 的任务（已结束的要加 -a 才看得到）" % pattern)
+    if stopped and not show_all:
+        print("(另有 %d 个已结束任务，`a2 ls -a` 查看，`a2 purge` 清空)" % len(stopped))
 
 
-def bdecode(data):
-    return _bdecode_at(data, 0)[0]
-
-
-def infohash_of(data):
-    """种子里 info 段的 sha1：直接对原始切片算，不重新编码（重编码会改字节）。"""
-    i = data.find(b"4:info")
-    if i < 0:
-        return ""
-    start = i + 6
-    try:
-        _val, end = _bdecode_at(data, start)
-    except Exception:                                    # noqa: BLE001
-        return ""
-    return hashlib.sha1(data[start:end]).hexdigest()
-
-
-def magnet_of(data):
-    """.torrent 字节 → 磁力（拿不到 infohash 返回 ""）。"""
-    ih = infohash_of(data)
-    if not ih:
-        return ""
-    name = ""
-    try:
-        info = bdecode(data).get(b"info") or {}
-        name = (info.get(b"name") or b"").decode("utf-8", "replace")
-    except Exception:                                    # noqa: BLE001
-        pass
-    return "magnet:?xt=urn:btih:%s%s" % (ih, ("&dn=" + urllib.parse.quote_plus(name)) if name else "")
-
-
-def verify_magnet(magnet, timeout=None):
-    """bt-metadata-only：从 DHT 拉真实元数据，确认「真有人在做种」。
-    两个坑写在这里，别改回去：
-      1) 这种模式下 RPC 的 bittorrent.info.name 是 None、totalLength 只有几十 KB（那是 [METADATA] 本身），
-         真实文件列表只能解析落盘的 <infohash>.torrent；
-      2) 校验任务照样占一个下载槽（conf 默认 max-concurrent-downloads=3），dir 用专用临时目录。
-    返回 {name, bytes, files, has_extras} 或 None（拿不到/超时）。"""
-    timeout = timeout or VERIFY_TIMEOUT
-    if not os.path.isdir(VERIFY_DIR):
-        os.makedirs(VERIFY_DIR, exist_ok=True)
-    m = re.search(r"btih:([0-9a-fA-F]{40})", magnet)
-    if not m:
-        print("  跳过校验：磁力里没有 40 位 infohash（base32 磁力不校验）")
-        return {"name": "(未校验)", "bytes": 0, "files": 0, "has_extras": False}
-    ih = m.group(1).lower()
-    gid = rpc("aria2.addUri", [[magnet], {"bt-metadata-only": "true", "bt-save-metadata": "true",
-                                          "seed-time": "0", "dir": VERIFY_DIR}])
-    deadline, status, offline, t = time.time() + timeout, "active", False, {}
-    while time.time() < deadline:
-        try:
-            t = rpc("aria2.tellStatus", [gid, ["status", "errorCode", "errorMessage"]])
-        except SystemExit:                               # 任务没了（被清/进程重启过）
-            offline = True
-            break
-        status = t["status"]
-        if status not in ("active", "waiting"):
-            break
-        time.sleep(3)
-    info = None
-    tp = os.path.join(VERIFY_DIR, ih + ".torrent")
-    if status == "complete" and os.path.exists(tp):
-        try:
-            with open(tp, "rb") as fh:
-                d = bdecode(fh.read())
-            i = d.get(b"info") or {}
-            files = i.get(b"files")
-            total = i.get(b"length") or sum(f.get(b"length", 0) for f in (files or []))
-            name = (i.get(b"name") or b"").decode("utf-8", "replace")
-            info = {"name": name, "bytes": total,
-                    "files": len(files) if files else 1,
-                    "has_extras": any(b"featurette" in p.lower() or b"extra" in p.lower()
-                                      for f in (files or []) for p in f.get(b"path", []))}
-        except Exception as exc:                         # noqa: BLE001
-            print("  元数据解析失败: %s" % exc)
-    try:
-        if status in ("active", "waiting"):
-            rpc("aria2.forceRemove", [gid])
-        rpc("aria2.removeDownloadResult", [gid])
-    except SystemExit:
-        pass
-    if os.path.exists(tp):
-        os.remove(tp)                                    # 校验产物不留
-    rpc("aria2.saveSession")
-    if info:
-        return info
-    if offline:
-        print("  校验中断：任务已不在 aria2 里")
-    elif status in ("active", "waiting"):
-        print("  校验超时 %ds：DHT 上没有节点给出元数据（搜索结果标的做种数不可信）。" % timeout)
-    elif status == "error":
-        print("  校验失败：aria2 errorCode=%s" % (t.get("errorCode") if isinstance(t, dict) else "?"))
-    else:
-        print("  校验无结论：任务状态 %s，但 %s 没拿到元数据" % (status, os.path.basename(tp)))
-    return None
+def cmd_concurrent(args):
+    """查/改同时下载的任务数（max-concurrent-downloads）。"""
+    cur = rpc("aria2.getGlobalOption").get("max-concurrent-downloads")
+    if not args:
+        print("max-concurrent-downloads = %s" % cur)
+        return
+    val = args[0]
+    if not val.isdigit() or int(val) < 1:
+        sys.exit("并发任务数要是 >=1 的整数（当前 %s）" % cur)
+    rpc("aria2.changeGlobalOption", [{"max-concurrent-downloads": val}])
+    print("max-concurrent-downloads = %s（本次运行有效；持久化就改 conf 的 "
+          "max-concurrent-downloads 再重启服务：%s）" % (val, service_restart_hint()))
 
 
 def main(argv):
@@ -482,37 +284,29 @@ def main(argv):
         print(__doc__)
         return 0
     if cmd in ("find", "grab"):
-        sys.exit("a2 %s 已移除：搜索在 skill 层（a2 只管下载）。\n"
+        sys.exit("a2 %s 已移除：搜索在 skill 层（a2 只管资源的增删改查）。\n"
                  "  a2 find <关键词>      → a2-search <关键词>       （站点在 ~/.aria2/search-sites.conf 里配置）\n"
-                 "  a2 grab <序号> --dir D → a2-search <关键词> --json 取磁力，再 a2 add --dir D --verify \"<磁力>\"\n"
+                 "  a2 grab <序号> --dir D → a2-search <关键词> --json 取磁力 → a2-verify <磁力> → "
+                 "a2 add --dir D <磁力>\n"
                  "  见 references/search-sites.md" % cmd)
     if cmd not in ("add", "ls", "list", "st", "info", "files", "pause",
-                   "unpause", "resume", "rm", "purge", "up", "down"):
+                   "unpause", "resume", "rm", "purge", "concurrent", "up", "down"):
         # 允许省略 add：`a2 --dir D <magnet>`、`a2 <url>`、`a2 -p <链接>` 都当成 add
         args, cmd = argv[1:], "add"
 
     if cmd == "add":
         cmd_add(args)
     elif cmd in ("ls", "list"):
-        show_all = bool(args and args[0] == "-a")
-        stopped = rpc("aria2.tellStopped", [0, 1000])
-        groups = [("活动", rpc("aria2.tellActive")),
-                  ("等待", rpc("aria2.tellWaiting", [0, 1000]))]
-        if show_all:
-            groups.append(("已结束", stopped))
-        for title, tasks in groups:
-            if tasks:
-                print("== %s ==" % title)
-                for t in tasks:
-                    print(row(t))
-        if stopped and not show_all:
-            print("(另有 %d 个已结束任务，`a2 ls -a` 查看，`a2 purge` 清空)" % len(stopped))
+        cmd_ls(args)
     elif cmd == "st":
         g = rpc("aria2.getGlobalStat")
-        print("下载 %s/s  上传 %s/s  活动 %s  等待 %s  已结束 %s" % (
+        opt = rpc("aria2.getGlobalOption")
+        print("下载 %s/s  上传 %s/s  活动 %s  等待 %s  已结束 %s  并发上限 %s" % (
             human(g["downloadSpeed"]), human(g["uploadSpeed"]), g["numActive"],
-            g["numWaiting"], g["numStopped"]))
+            g["numWaiting"], g["numStopped"], opt.get("max-concurrent-downloads", "?")))
     elif cmd == "info":
+        if not args:
+            sys.exit("缺少 gid，先用 `a2 ls` 查")
         t = rpc("aria2.tellStatus", [resolve(args[0])[0],
                  ["gid", "status", "totalLength", "completedLength", "downloadSpeed",
                   "uploadSpeed", "connections", "numSeeders", "errorCode", "errorMessage",
@@ -523,6 +317,8 @@ def main(argv):
         for f in t.get("files", []):
             print("  [%s] %s %s" % (f.get("index"), human(f.get("length")), f.get("path")))
     elif cmd == "files":
+        if not args:
+            sys.exit("缺少 gid，先用 `a2 ls` 查")
         for f in rpc("aria2.getFiles", [resolve(args[0])[0]]):
             print("[%s] %s %s" % (f.get("index"), human(f.get("length")), f.get("path")))
     elif cmd in ("pause", "unpause", "resume"):
@@ -542,7 +338,6 @@ def main(argv):
     elif cmd == "rm":
         if not args:
             sys.exit("缺少 gid 或 all")
-        waiting = [t["gid"] for t in rpc("aria2.tellWaiting", [0, 1000])]
         stopped = [t["gid"] for t in rpc("aria2.tellStopped", [0, 1000])]
         for gid in (all_gids() if args[0] == "all" else resolve(args[0])):
             try:
@@ -557,6 +352,8 @@ def main(argv):
         rpc("aria2.saveSession")
     elif cmd == "purge":
         print(rpc("aria2.purgeDownloadResult") or "已清空")
+    elif cmd == "concurrent":
+        cmd_concurrent(args)
     elif cmd in ("up", "down"):
         if not args:
             sys.exit("缺少速率，如 1M / 0")

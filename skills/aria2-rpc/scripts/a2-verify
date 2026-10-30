@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+"""a2-verify —— 资源可用性校验（skill 层）：这条磁力/种子「真的有人在给数据」吗？
+
+a2 只负责对资源做增删改查，不做「值不值得下」的判断。搜索结果页标的做种数会撒谎，
+所以下载前用 bt-metadata-only 从 DHT 拉一次真实元数据：拉得到 = 真有人在做种 + 磁力没被改。
+
+实现方式：临时往 aria2 里加一个「只要元数据」的任务（占一个下载槽、落 A2_VERIFY_DIR），
+拿到 <infohash>.torrent 后解析、删任务、删产物。RPC 复用 a2 主程序里的实现（端口/密钥同源）。
+
+用法:
+  a2-verify <磁力|file.torrent> [--timeout S] [--json]
+  a2-verify --help
+
+退出码: 0 = 拿到元数据（可下）；1 = 拿不到（没人做种/超时/磁力坏了）。
+--json 时 stdout 只有 JSON：拿不到元数据也会打 {"ok": false, ...}，便于脚本判断。
+"""
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import sys
+import time
+import urllib.parse
+
+VERIFY_TIMEOUT = int(os.environ.get("A2_VERIFY_TIMEOUT", "90"))
+VERIFY_DIR = os.path.expanduser(os.environ.get("A2_VERIFY_DIR", "~/.aria2/tor-cache"))
+
+
+def load_a2():
+    """复用 a2 的 RPC 实现（端口/密钥/HTTP 400 解析只有一份，别各写一份）。"""
+    cands = [os.environ.get("A2_BIN"), os.path.expanduser("~/.aria2/a2"),
+             os.path.join(os.path.dirname(os.path.realpath(__file__)), "a2")]
+    for path in cands:
+        if path and os.path.isfile(path):
+            loader = importlib.machinery.SourceFileLoader("a2_for_verify", path)
+            spec = importlib.util.spec_from_loader("a2_for_verify", loader)
+            mod = importlib.util.module_from_spec(spec)
+            loader.exec_module(mod)
+            return mod
+    sys.exit("找不到 a2 主程序（用 A2_BIN=/path/to/a2 指定，或先跑 install-a2.sh）")
+
+
+def _bdecode_at(data, i):
+    """bencode 解析，返回 (值, 下一个位置)。只为了读 .torrent 的 info 段。"""
+    c = data[i:i + 1]
+    if c == b"i":
+        j = data.index(b"e", i)
+        return int(data[i + 1:j]), j + 1
+    if c == b"l":
+        i, out = i + 1, []
+        while data[i:i + 1] != b"e":
+            v, i = _bdecode_at(data, i)
+            out.append(v)
+        return out, i + 1
+    if c == b"d":
+        i, out = i + 1, {}
+        while data[i:i + 1] != b"e":
+            k, i = _bdecode_at(data, i)
+            v, i = _bdecode_at(data, i)
+            out[k] = v
+        return out, i + 1
+    j = data.index(b":", i)
+    n = int(data[i:j])
+    return data[j + 1:j + 1 + n], j + 1 + n
+
+
+def bdecode(data):
+    return _bdecode_at(data, 0)[0]
+
+
+def infohash_of(data):
+    """种子里 info 段的 sha1：直接对原始切片算（重编码会改字节，哈希就变了）。"""
+    i = data.find(b"4:info")
+    if i < 0:
+        return ""
+    start = i + 6
+    try:
+        _val, end = _bdecode_at(data, start)
+    except Exception:                                    # noqa: BLE001
+        return ""
+    import hashlib
+    return hashlib.sha1(data[start:end]).hexdigest()
+
+
+def magnet_of_torrent(data):
+    ih = infohash_of(data)
+    if not ih:
+        return ""
+    name = ""
+    try:
+        info = bdecode(data).get(b"info") or {}
+        name = (info.get(b"name") or b"").decode("utf-8", "replace")
+    except Exception:                                    # noqa: BLE001
+        pass
+    return "magnet:?xt=urn:btih:%s%s" % (ih, ("&dn=" + urllib.parse.quote_plus(name)) if name else "")
+
+
+def as_magnet(arg):
+    """磁力就用它；本地 .torrent 算 infohash 拼磁力。"""
+    if arg.startswith("magnet:"):
+        return arg
+    if os.path.isfile(arg):
+        with open(arg, "rb") as fh:
+            mag = magnet_of_torrent(fh.read())
+        if not mag:
+            sys.exit("这个文件不像种子（读不出 info 段）：%s" % arg)
+        return mag
+    sys.exit("既不是磁力也不是存在的 .torrent 文件：%s" % arg)
+
+
+def verify(magnet, timeout=None, say=print):
+    """返回 {ok, name, bytes, files, has_extras, error} —— 不抛异常，结论如实。"""
+    a2 = load_a2()
+    timeout = timeout or VERIFY_TIMEOUT
+    m = re.search(r"btih:([0-9a-fA-F]{40})", magnet)
+    if not m:
+        return {"ok": False, "error": "磁力里没有 40 位 infohash（base32 磁力不支持校验）"}
+    ih = m.group(1).lower()
+    os.makedirs(VERIFY_DIR, exist_ok=True)
+    gid = a2.rpc("aria2.addUri", [[magnet], {"bt-metadata-only": "true", "bt-save-metadata": "true",
+                                             "seed-time": "0", "dir": VERIFY_DIR}])
+    deadline, status, offline, t = time.time() + timeout, "active", False, {}
+    while time.time() < deadline:
+        try:
+            t = a2.rpc("aria2.tellStatus", [gid, ["status", "errorCode", "errorMessage"]])
+        except SystemExit:                               # 任务没了（被清/进程重启过）
+            offline = True
+            break
+        status = t["status"]
+        if status not in ("active", "waiting"):
+            break
+        time.sleep(3)
+
+    result = {"ok": False, "ih": ih, "magnet": magnet}
+    tp = os.path.join(VERIFY_DIR, ih + ".torrent")
+    if status == "complete" and os.path.exists(tp):
+        try:
+            with open(tp, "rb") as fh:
+                d = bdecode(fh.read())
+            info = d.get(b"info") or {}
+            files = info.get(b"files")
+            total = info.get(b"length") or sum(f.get(b"length", 0) for f in (files or []))
+            result.update(ok=True, name=(info.get(b"name") or b"").decode("utf-8", "replace"),
+                          bytes=total, files=len(files) if files else 1,
+                          has_extras=any(b"featurette" in p.lower() or b"extra" in p.lower()
+                                         for f in (files or []) for p in f.get(b"path", [])))
+        except Exception as exc:                         # noqa: BLE001
+            result["error"] = "元数据解析失败: %s" % exc
+    try:
+        if status in ("active", "waiting"):
+            a2.rpc("aria2.forceRemove", [gid])
+        a2.rpc("aria2.removeDownloadResult", [gid])
+    except SystemExit:
+        pass
+    if os.path.exists(tp):
+        os.remove(tp)                                    # 校验产物不留
+    a2.rpc("aria2.saveSession")
+
+    if not result["ok"] and "error" not in result:
+        if offline:
+            result["error"] = "校验中断：任务已不在 aria2 里"
+        elif status in ("active", "waiting"):
+            result["error"] = "超时 %ds：DHT 上没有节点给出元数据（搜索结果标的做种数不可信）" % timeout
+        elif status == "error":
+            result["error"] = "aria2 报错 errorCode=%s" % (t.get("errorCode") if isinstance(t, dict) else "?")
+        else:
+            result["error"] = "任务状态 %s，但没拿到元数据" % status
+    return result
+
+
+USAGE = __doc__
+
+
+def main(argv):
+    args = argv[1:]
+    if not args or args[0] in ("-h", "--help", "help"):
+        print(USAGE.strip())
+        return 2 if not args else 0
+    as_json, timeout, target = False, None, None
+    while args:
+        a, args = args[0], args[1:]
+        if a == "--json":
+            as_json = True
+        elif a == "--timeout" and args:
+            timeout = float(args.pop(0))
+        else:
+            target = a
+    if not target:
+        sys.exit("用法: a2-verify <磁力|file.torrent> [--timeout S] [--json]")
+    magnet = as_magnet(target)
+    if not as_json:
+        print("校验中（bt-metadata-only，最多 %ds）…" % (timeout or VERIFY_TIMEOUT))
+    res = verify(magnet, timeout)
+    if as_json:
+        print(json.dumps(res, ensure_ascii=False))
+    elif res["ok"]:
+        print("✓ 元数据到手: %s ｜ %d 个文件 / %.2f GB%s" % (
+            res["name"], res["files"], res["bytes"] / 1e9, "（含花絮）" if res["has_extras"] else ""))
+    else:
+        print("× 拿不到元数据：%s" % res["error"])
+    return 0 if res["ok"] else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

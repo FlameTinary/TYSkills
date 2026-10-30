@@ -67,6 +67,9 @@ echo "大小: $SIZE_STR"
 echo "输出目录: $OUTPUT_DIR"
 echo ""
 
+# 落点检查（建目录 + 挂载判据 + 剩余空间），再做下载
+OUTPUT_DIR=$(a2-dest check "$OUTPUT_DIR") || exit 1
+
 # 用 a2 下载
 echo "正在添加到 a2 下载队列..."
 a2 add --dir "$OUTPUT_DIR" "$RAW_URL"

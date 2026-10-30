@@ -77,7 +77,7 @@ echo "找到 $FILE_COUNT 个文件，开始添加下载任务..."
 echo ""
 
 # 确保输出目录存在
-mkdir -p "$OUTPUT_DIR"
+OUTPUT_DIR=$(a2-dest check "$OUTPUT_DIR") || exit 1
 
 # 逐个添加下载
 SUCCESS=0

@@ -74,8 +74,8 @@ echo "大小: $SIZE_STR"
 echo "输出: $OUTPUT_DIR"
 echo ""
 
-# 确保输出目录存在
-mkdir -p "$OUTPUT_DIR"
+# 落点检查在 skill 层（建目录 + 挂载判据 + 剩余空间）；a2 只要求目录已存在
+OUTPUT_DIR=$(a2-dest check "$OUTPUT_DIR") || exit 1
 
 # 添加到 a2
 echo "正在添加下载任务..."
