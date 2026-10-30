@@ -8,12 +8,12 @@
 | 依赖 | 用途 | macOS | Debian/Ubuntu | Fedora/Arch | Windows |
 |---|---|---|---|---|---|
 | aria2c | 下载引擎 | `brew install aria2` | `sudo apt install aria2` | `sudo dnf install aria2` / `sudo pacman -S aria2` | `winget install aria2.aria2` / `scoop install aria2` |
-| python3 | a2 / 钩子 / 清洗 / 搜索源脚本 | `brew install python3`（系统自带也可） | `sudo apt install python3` | `sudo dnf install python3` | WSL 自带；原生用 python.org 安装包 |
+| python3 | a2 / a2-dest / a2-search / 搜索源脚本 | `brew install python3`（系统自带也可） | `sudo apt install python3` | `sudo dnf install python3` | WSL 自带；原生用 python.org 安装包 |
 | curl | AList 助手、RPC 探活 | 系统自带 | `sudo apt install curl` | `sudo dnf install curl` | 系统自带（Win10+） |
 | ffprobe (ffmpeg) | 可选：自己校验文件完整性（a2 不再调用） | `brew install ffmpeg` | `sudo apt install ffmpeg` | `sudo dnf install ffmpeg` | `winget install ffmpeg` / `scoop install ffmpeg` |
 | AList + 云盘 | 网盘直链下载（可选） | 见 §5 | 同 | 同 | 同 |
 
-搜索源不需要额外依赖：源是你自己的脚本/命令，见 `references/tor-source.md`。
+搜索不需要额外依赖：站点配置见 `references/search-sites.md`（HTML 模式直接抓页面，cmd 模式是你的脚本）。
 
 ## 2. 一键部署（推荐）
 
@@ -27,12 +27,12 @@ A2_SERVICE=a2.你的名字 bash scripts/install-a2.sh
 
 1. 依赖检查（aria2c/python3/curl），缺失时按平台给安装命令；
 2. 建 `~/.aria2`，touch 空 `aria2.session` / `aria2.log`（session 文件不存在 aria2 会直接退出）；
-3. 安装核心脚本：`a2`、`start-aria2.sh` → `~/.aria2/`，`a2-dest` → `~/.local/bin`；
+3. 安装核心脚本：`a2`、`start-aria2.sh` → `~/.aria2/`，`a2-dest` / `a2-search` → `~/.local/bin`；
 4. 首次运行 `a2-dest`：按当前 OS 生成默认下载目录并写入 `~/.aria2/dest.conf`（已存在则沿用，不覆盖用户改过的值）；
 5. `~/.local/bin/a2` 软链到 `~/.aria2/a2`；AList 四件套复制到 `~/.local/bin`（不在 PATH 会给出提示）；
-6. 搜索源脚本 `tor-source-demo.py` / `tor-source-template.py` → `~/.aria2/`；
+6. 搜索源脚本 `search-source-demo.py` / `search-source-template.py` → `~/.aria2/`，并生成 `search-sites.conf`（不覆盖已有的）；
 7. 无 `aria2.conf` 时用模板生成（随机 `rpc-secret`，`__HOME__` 替换成实际家目录），并 `chmod 600`；
-8. 无 `a2.conf` 时用模板生成（a2 专有配置：搜索源、服务名）；
+8. 无 `a2.conf` 时用模板生成（a2 专有配置：服务名）；
 9. **按平台装服务**：macOS → launchd（`~/Library/LaunchAgents/<服务名>.plist`）并启动；
    Linux → systemd 用户服务（`~/.config/systemd/user/<服务名>.service`）`enable --now`；
    Windows → 打印计划任务 / nssm 的等价命令，可手动前台启动。最后验证 `a2 st`。
@@ -46,7 +46,8 @@ touch ~/.aria2/aria2.session ~/.aria2/aria2.log
 cp scripts/a2 scripts/start-aria2.sh ~/.aria2/
 cp scripts/a2-dest ~/.local/bin/ && chmod 755 ~/.local/bin/a2-dest
 a2-dest >/dev/null            # 首次运行：按 OS 生成默认下载目录并持久化
-cp scripts/tor-source-demo.py scripts/tor-source-template.py ~/.aria2/
+cp scripts/search-source-demo.py scripts/search-source-template.py ~/.aria2/
+# 搜索站点：assets/search-sites.conf.template → ~/.aria2/search-sites.conf（替换 __HOME__，然后填 site= 行）
 ln -sf ~/.aria2/a2 ~/.local/bin/a2
 # aria2.conf：assets/aria2.conf.template → ~/.aria2/aria2.conf，替换 __HOME__ 与 __RPC_SECRET__，然后 chmod 600
 # a2.conf   ：assets/a2.conf.template      → ~/.aria2/a2.conf，  替换 __HOME__ 与 __LABEL__
@@ -75,11 +76,12 @@ loginctl enable-linger "$USER"        # 可选：没登录也让它常驻
 ```
 
 两个配置文件的分工：**aria2.conf** 只放 aria2 认识的键（端口、密钥、目录、BT 参数）；
-**a2.conf** 放 a2 专有配置（搜索源、服务名）——写进 aria2.conf 只会换来每次启动的 `[WARN] Unknown option` 刷屏。
+**a2.conf** 放 a2 专有配置（目前只有服务名）——写进 aria2.conf 只会换来每次启动的 `[WARN] Unknown option` 刷屏；
+搜索站点在 `search-sites.conf`，落点在 `dest.conf`，两者 a2 都不读。
 
 ## 4. 落点与空间保护
 
-落点是**显式**的：`a2 add --dir DIR` / `a2 grab … --dir DIR`，a2 不改名、不搬动、不建暂存区。
+落点是**显式**的：`a2 add --dir DIR`，a2 不改名、不搬动、不建暂存区。
 
 ```
 a2-dest            # 默认下载目录（首次按 OS 生成：macOS ~/Downloads、Linux XDG、Windows %USERPROFILE%\Downloads）
@@ -108,15 +110,18 @@ a2-dest media      # 媒体库根（未设置 = 默认下载目录）
 5. 助手脚本的密码统一从 `~/.alist/admin_password.txt` 读（没有文件则交互输入）——
    **不要把密码写进脚本或命令行**，命令行参数会出现在 `ps` 输出里。
 
-## 6. 搜索源配置（a2 find 用）
+## 6. 搜索站点配置（a2-search 用）
 
 ```bash
-# ~/.aria2/a2.conf 里一行：
-tor-source-cmd=python3 ~/.aria2/tor-source-demo.py      # 离线自测（不联网，先跑通流程）
+# ~/.aria2/search-sites.conf（模板 assets/search-sites.conf.template）
+site=某站|https://example.org/search?q={query}&page={page}   # HTML 结果页，自动抽 magnet
+site=本地演示|cmd:python3 ~/.aria2/search-source-demo.py      # 离线自测（不联网，先跑通流程）
+websearch=https://www.bing.com/search?q={query}               # 全网发现（--discover）
 ```
 
-契约、字段表、示例脚本、排查：`references/tor-source.md`。
-没配之前 `a2 find` 会打印配置步骤并以非零码退出 —— 不会假装"没有结果"。
+`a2-search sites` 看已配置的源；`a2-search <关键词>` 搜；`a2-search --discover <关键词>` 只列结果页链接。
+契约、字段表、示例脚本、排查：`references/search-sites.md`。
+没配站点时 `a2-search` 会打印配置步骤并非零退出 —— 不会假装"没有结果"。
 
 ## 7. 守护进程与服务管理
 

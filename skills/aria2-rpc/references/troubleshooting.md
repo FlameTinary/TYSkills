@@ -80,7 +80,7 @@ Linux `systemctl --user status <服务名>`，Windows `schtasks /Query /TN "<服
 | 空闲时 `lsof` 看不到 BT 监听端口 | BT 端口是**懒绑定**的，有任务时才出现（Windows 用 `netstat -ano \| findstr <端口>`）。不要因此"修"配置 |
 | `seed-time=0` 与 `seed-ratio` | 设了 `seed-time` 后，到时间或到比率**任一**满足就停止做种（man 页），所以 `seed-ratio` 基本是死配置。不想做种就 `seed-time=0` |
 | 上传占满上行 | 保留 `max-overall-upload-limit`（模板给 2M）。它是全局选项，也能运行时改：`aria2.changeGlobalOption {"max-overall-upload-limit":"2M"}` |
-| 冷门资源一直 0 速度 | 公共 BT 的正常现象，`bt-stop-timeout=0` 时不会自停。用 `a2 grab` 的元数据校验判断"到底有没有人在做种" |
+| 冷门资源一直 0 速度 | 公共 BT 的正常现象，`bt-stop-timeout=0` 时不会自停。用 `a2 add --verify` 的元数据校验判断"到底有没有人在做种" |
 
 ## 7. 落点（谁决定下到哪）与媒体库
 
@@ -101,8 +101,8 @@ Linux `systemctl --user status <服务名>`，Windows `schtasks /Query /TN "<服
   （`scripts/aria2_cli.py` 与 `a2` 都已处理）
 - `a2` 的端口/密钥来自 `~/.aria2/aria2.conf`（`rpc-listen-port` / `rpc-secret`），所以不用手动传；
   要临时覆盖用 `A2_SECRET`，要指向另一份配置用 `A2_CONF`
-- `a2` 的专有配置（`find` 的搜索源、服务名）在 `~/.aria2/a2.conf`，**不要写进 aria2.conf**；
-  落点配置在 `~/.aria2/dest.conf`（`a2-dest` 维护），a2 自己不读它
+- `a2` 的专有配置（目前只有服务名）在 `~/.aria2/a2.conf`，**不要写进 aria2.conf**；
+  落点配置在 `~/.aria2/dest.conf`（`a2-dest` 维护）、搜索站点在 `~/.aria2/search-sites.conf`（`a2-search` 读），a2 自己两个都不读
   （aria2 会为未知键打 `[WARN] Unknown option` 刷屏）
 - 服务名默认 `com.example.aria2`：安装时用 `A2_SERVICE=a2.<你的名字> bash scripts/install-a2.sh` 换掉；
   `a2.conf` 里的 `service=` 保持同一个名字，a2 报错时给的提示命令才是对的

@@ -6,20 +6,20 @@
 ## 简介
 
 把 aria2 变成一个**开箱可用的下载中枢**。核心是一个 `a2` 命令行封装：aria2 本身只认 JSON-RPC，
-`a2` 把它包装成日常命令。**落点分工是明确的**：`a2` 只把文件下到你用 `--dir` 指定的目录
-（不推断分类、不改名、不搬动）；「默认下载目录」和「电影/剧集/私藏」这类子目录由技能这一层决定
-（`a2-dest` 首次按 OS 生成默认值并持久化，之后可随时改）。
+`a2` 把它包装成日常命令。**职责三分**：`a2` 只下载到你用 `--dir` 指定的目录（不搜索、不推断分类、
+不改名、不搬动）；**搜索**在技能层的 `a2-search`（在你自己配置的站点里搜，`--discover` 做全网发现，
+不内置任何资源站）；**落点**也在技能层（`a2-dest` 首次按 OS 生成默认下载目录并持久化）。
 a2 没覆盖的能力（`select-file` 按索引只下整季包里的部分集、`bt-metadata-only` 定制校验、
 addTorrent 自定义选项）再回落到裸 aria2 JSON-RPC。
 
 解决的具体问题：
 
 - **落点决策在技能层**：`a2-dest` 首次运行按当前 OS 生成默认下载目录（macOS/Linux/Windows 各自的用户下载目录）并写入 `~/.aria2/dest.conf`；改一次就长期沿用。分类子目录（`Movies`/`TV`/`Private`）由技能按标题判断后拼进 `--dir`，脚本里没有任何分类逻辑。
-- **搜索 → 校验 → 下载**：`a2 find` 调你自配的搜索源，`a2 grab` 先做真做种校验（源标的做种数会撒谎），通过后下到 `--dir`。
+- **搜索在自己的站点里做（也支持全网）**：`a2-search` 读 `~/.aria2/search-sites.conf` 的 `site=` 行（HTML 结果页自动抽磁力，或 `cmd:` 自写源），`--discover` 用 `websearch=` 列全网结果页；`a2 add --verify` 先做真做种校验（结果页标的做种数会撒谎）再下到 `--dir`。
 - **整季包只下缺的集**：已有 E01/E03/E06，只补 E02/E04/E05，不重复下 12GB（裸 RPC `select-file`）。
 - **网盘直链下载**：AList 接入阿里云盘等，`a2-alist` / `a2-alist-dir` 拉直链交给 aria2。
 - **一键部署为守护进程**：macOS launchd / Linux systemd --user / Windows 计划任务，崩溃自动拉起，配置模板由脚本按平台与 `$HOME` 渲染。
-- **本技能不含任何站点**：搜索源由使用者在 `~/.aria2/a2.conf` 里配置一条命令（`tor-source-cmd=`），脚本不内置、不硬编码任何站点。
+- **本技能不含任何站点**：站点全部由使用者在 `~/.aria2/search-sites.conf` 里配置（HTML 或 `cmd:` 两种形式），脚本不内置、不硬编码任何资源站。
 
 不适用：非 aria2 的下载方式（yt-dlp、浏览器下载、纯 HTTP 脚本）、qBittorrent/Transmission 生态、需要图形界面的场景。
 
@@ -52,7 +52,8 @@ bash scripts/install-a2.sh
    macOS → `~/Library/LaunchAgents/com.example.aria2.plist`（launchd，KeepAlive）
    Linux → `~/.config/systemd/user/com.example.aria2.service`（systemd --user，Restart=always）
    Windows → 打印计划任务 / nssm 的等价命令；
-4. 装 `a2`（→ `~/.aria2/`，软链到 `~/.local/bin`）与 `a2-dest`（→ `~/.local/bin`），并首次运行 `a2-dest` 生成默认下载目录（已存在则沿用，不覆盖）。
+4. 装 `a2`（→ `~/.aria2/`，软链到 `~/.local/bin`）与 `a2-dest` / `a2-search`（→ `~/.local/bin`），
+   首次运行 `a2-dest` 生成默认下载目录、生成 `search-sites.conf` 模板（已存在的都不覆盖）。
 
 **换机器必改的常量**（环境变量覆盖，或改 `install-a2.sh` 顶部）：
 
@@ -62,6 +63,7 @@ bash scripts/install-a2.sh
 | `a2-dest media`（`media-root`） | 同 `download-dir` | 媒体库根；改：`a2-dest media set <目录>`（技能在它下面用 `Movies`/`TV`/`Private`） |
 | `A2_MIN_FREE_GB` | `20` | 目标盘最小剩余空间，不足则拒绝任务（可临时 `A2_MIN_FREE_GB=5 a2 add ...`） |
 | `A2_SERVICE` | `com.example.aria2` | 服务名（launchd 标签 / systemd unit / 计划任务名） |
+| `a2-search`（`search-sites.conf`） | 只有 `websearch=`（Bing） | 搜索站点：`site=<名字>\|<URL>\|cmd:<命令>`，见 references/search-sites.md |
 
 （`A2_DOWNLOAD_DIR` / `A2_MEDIA_ROOT` 现在只作为 AList 助手脚本的临时覆盖保留。）
 
@@ -100,23 +102,27 @@ a2 ls                                       # 任务列表；a2 st 看速率；a
 `--dir` 必填：不带就报错，a2 不会替你猜目录。分类判断（电影/剧集/私藏）由技能按标题做，
 脚本里没有这套逻辑。
 
-### 配好搜索源 → 搜索 → 下载
+### 配好站点 → 搜索 → 下载
 
-搜索源要自己配一条命令（本技能不内置站点）：
+站点要自己配（本技能不内置资源站）：
 
 ```bash
-# ~/.aria2/a2.conf
-#   tor-source-cmd=<你的搜索源命令>     # 命令里可用 {query}/{page} 占位符，或读 A2_QUERY/A2_PAGE/A2_PAGES
+# ~/.aria2/search-sites.conf
+#   site=某站|https://example.org/search?q={query}&page={page}    # HTML 结果页，自动抽磁力
+#   site=某站|cmd:<你的命令>                                      # 自写源，输出 JSON 行
+#   websearch=https://www.bing.com/search?q={query}                # 全网发现（--discover）
 # 想先离线跑通流程（不联网）：
-#   tor-source-cmd=python3 ~/.aria2/tor-source-demo.py
+#   site=本地演示|cmd:python3 ~/.aria2/search-source-demo.py
 
-a2 find "关键词 压制组" --res 1080p        # 关键词语言跟着你的源站点走
-a2 find 关键词 --json                      # 调源时先看这条：字段到底有没有被认出来
-a2 find 关键词 --all                       # 搜单集（默认只留整季/全集，排除单集 SxxExx）
-a2 grab 1,3,5 --dir "$(a2-dest media)/TV"  # 按序号（可多个/区间 2-4）下到选定的目录，默认先做真做种校验
+a2-search sites                            # 看已配置的源
+a2-search "关键词 压制组" --res 1080p        # 在配置站点里搜（关键词语言跟着站点走）
+a2-search 关键词 --json                     # 完整磁力（调试源时先看这条）
+a2-search 关键词 --all                      # 搜单集（默认只留整季/全集，排除单集 SxxExx）
+a2-search --discover 关键词                 # 站点都不命中：先列出全网结果页
+a2 add --dir "$(a2-dest media)/TV" --verify "<磁力>"   # 下到选定目录，先验真做种
 ```
 
-搜索源命令的 JSON 字段契约、写自己的源、排查：见 `references/tor-source.md`。
+站点配置、HTML 抽取规则、cmd 源字段契约、全网发现与排查：见 `references/search-sites.md`。
 
 ### 任务管理 / 限速
 
@@ -148,8 +154,9 @@ a2-alist-dir "/aliyun/剧集" "$(a2-dest media)/TV" "*.mkv"   # 目录批量下�
 ### 故障排查
 
 ```bash
-a2 find 报「没有配置搜索源」        → 在 ~/.aria2/a2.conf 填 tor-source-cmd
-a2 find 报源失败/超时/非 JSON       → 源的问题：单独跑那条命令；A2_TOR_DEBUG=1 看完整命令与 stderr
+a2-search 报「还没有配置站点」      → 在 ~/.aria2/search-sites.conf 加 site= 行
+a2-search 抓到 0 条磁力             → 结果页改版/JS 渲染：换站点 URL、写 cmd: 源，或 --discover 找别处
+a2-search 报源失败/超时/非 JSON     → 源的问题：单独跑那条命令；A2_SEARCH_DEBUG=1 看完整命令与 stderr
 a2 报 RPC 不可用                    → 确认守护在跑（launchctl / systemctl / schtasks），重启后 a2 st 复验
 任务 0 速度 / 卡在元数据            → 公共 BT 冷门资源正常；查 ~/.aria2/aria2.log
 a2 add 报「缺少目标目录」           → a2 不推断落点：a2 add --dir "$(a2-dest)" …
@@ -175,7 +182,7 @@ a2 add 报「缺少目标目录」           → a2 不推断落点：a2 add --d
 | 文件 | 内容 |
 |---|---|
 | `references/a2-commands.md` | a2 全部子命令逐一详解（参数/示例/坑） |
-| `references/tor-source.md` | 搜索源契约：配置、JSON 字段表与别名、写自己的源、排查 |
+| `references/search-sites.md` | 搜索站点契约：HTML/cmd 两种源、JSON 字段表与别名、全网发现、排查 |
 | `references/troubleshooting.md` | 排错分类表与「用血换来的事实」 |
 | `references/setup.md` | 搭建部署（macOS/Linux/Windows）、服务管理、落点配置、维护 |
 | `references/install-guide.md` | AList 手动安装指南 |
@@ -186,7 +193,7 @@ a2 add 报「缺少目标目录」           → a2 不推断落点：a2 add --d
 ## 免责声明
 
 本技能为 aria2 的自动化封装与运维便利，**不包含、不内置、不推荐任何内容站点**。
-搜索源由使用者自行配置，请遵守你所在地区的法律法规与版权规定，仅用于你有权下载的内容。
+搜索站点由使用者自行配置，请遵守你所在地区的法律法规与版权规定，仅用于你有权下载的内容。
 技能中的示例路径、主机名、服务名、令牌一律为占位符，不含作者机器的真实信息。
 
 ## License

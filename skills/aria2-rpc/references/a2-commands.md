@@ -1,10 +1,11 @@
 # a2 命令完整参考
 
-a2 主程序：`~/.aria2/a2`（`~/.local/bin/a2` 是软链）。aria2 的端口/密钥自动从 `~/.aria2/aria2.conf` 读取（`rpc-listen-port`、`rpc-secret`）；a2 自己的配置（搜索源、服务名）在 `~/.aria2/a2.conf`。
+两个命令面：**`a2`**（下载/任务，`~/.aria2/a2`，`~/.local/bin/a2` 是软链）与 **`a2-search`**（搜索，技能层）。
+aria2 的端口/密钥自动从 `~/.aria2/aria2.conf` 读取（`rpc-listen-port`、`rpc-secret`）；a2 自己的配置（目前只有服务名）在 `~/.aria2/a2.conf`；搜索站点在 `~/.aria2/search-sites.conf`。
 
 ## 0. 落点配置：`a2-dest`（技能层，不是 a2 的选项）
 
-a2 自己**不决定任何落点**：`a2 add` / `a2 grab` 都必须显式给 `--dir`。默认目录与分类子目录的这一层决策在这里：
+a2 自己**不决定任何落点**：`a2 add` 必须显式给 `--dir`。默认目录与分类子目录的这一层决策在这里：
 
 ```
 a2-dest                   # 打印默认下载目录；首次运行按 OS 生成并写入 ~/.aria2/dest.conf
@@ -31,60 +32,47 @@ a2-dest --json            # {"config":…,"download-dir":…,"media-root":…}
 ## 1. `a2 add` — 添加下载到指定目录（默认入口，可省略 add 字样）
 
 ```
-a2 add --dir DIR [-p] [-o 文件名] <url|magnet|file.torrent|urls.txt> ...
+a2 add --dir DIR [--verify] [-p] [-o 文件名] <url|magnet|file.torrent|urls.txt> ...
 ```
 
 选项：
 | 选项 | 含义 |
 |---|---|
 | `--dir DIR` | **必填**：下到 DIR（不存在则创建）。只负责下载，不改名、不搬动、不做分类 |
+| `--verify` | 先做 bt-metadata-only 真做种校验（磁力/种子），拉不到元数据就跳过该条 |
 | `-p` / `--pause` | 加入后先暂停 |
 | `-o 名字` | 指定保存文件名 |
 
 行为：
 - **不给 `--dir` 直接报错退出**，不会退回任何「默认库」或按名字猜目录；
 - 目标目录不可用时拒绝加任务（跨平台判据：目录不存在且会被建到系统盘上 —— 通常是外接盘/网络盘没挂载）；
-  目标盘剩余不足阈值也拒绝（见 §8 的 `A2_MIN_FREE_GB`）；
+  目标盘剩余不足阈值也拒绝（见 §7 的 `A2_MIN_FREE_GB`）；
 - 已删除的落点参数（`-m` / `-t` / `-P` / `-flat` / `-d`）现在会报「已移除的选项」并提示改用 `--dir`；
-- 落点的决策在技能层：基目录 `a2-dest`、分类子目录由技能拼（见 §0）。
+- 落点的决策在技能层：基目录 `a2-dest`、分类子目录由技能拼（见 §0）；
+- `--verify` 只对磁力/`.torrent` 生效（URL 直接跳下）：校验任务占一个下载槽，产物落
+  `A2_VERIFY_DIR`（默认 `~/.aria2/tor-cache`）并在结束时删掉。
 
 输入形式：URL、磁力、本地 `.torrent` 文件、文本文件（每行一个链接，`#` 注释）。
 
-## 2. `a2 find` — 搜索（源由你自己配置）
+## 2. `a2-search` — 搜索（技能层，不是 a2 的子命令）
+
+`a2 find` / `a2 grab` 已移除：搜索不在 a2 里。完整契约（HTML 抽取规则、cmd 源字段表、全网发现、排查）
+见 **`references/search-sites.md`**，这里只列形状：
 
 ```
-a2 find <关键词> [--pages N] [--min-seeds N] [--res 1080p] [--prefer 组A,组B] [--all] [--refresh] [--json]
+a2-search <关键词> [--pages N] [--min-seeds N] [--res 1080p] [--prefer 组A,组B] [--all]
+                   [--json] [--site 名字] [--timeout S]
+a2-search --discover <关键词> [--json]     # 全网发现：结果页链接（配合 agent 的 web 工具）
+a2-search sites                            # 列出已配置的站点/搜索源
 ```
 
-- **a2 不内置任何种子站/索引站**：`a2 find` 调用 `~/.aria2/a2.conf` 里 `tor-source-cmd=` 配置的
-  「搜索源命令」（临时换源：`A2_TOR_CMD='…' a2 find …`）。源把结果以 JSON 打到 stdout，
-  契约、字段别名、示例脚本见 `references/tor-source.md`；随附 `tor-source-demo.py`（离线自测）与
-  `tor-source-template.py`（接入骨架）
-- 源非零退出 / 超时 / 输出不是 JSON，都会**明确报错并以非零码退出**，绝不会伪装成「没有结果」
-- 默认过滤（只看标题/分类文本，与用哪个源无关）：电影分类全留（单片没有「整季」概念）；
-  剧集分类必须命中「整季/全集」且**不是单集 SxxExx**；噪音（3D/SBS/Hindi/多语/FLAC/电子书）剔除；
-  `--all` 放宽到全部分类（含单集，噪音词仍剔除）
-- 源没给分类时 a2 按标题推断（`S01E02`/`S01`/`第N季`/`全N集`/`合集`/`Season N` → TV；年份或 `1080p` 等 → Movies）
-- 结果按做种数排序，`--prefer` 里的压制组排最前
-- **缓存** `~/.aria2/find-cache.json`（v4：按 源指纹+关键词+页数 分键，默认 15 分钟内复用，`--refresh` 强制重抓）；
-  只存源返回的**原始行**，所以换过滤参数不会互相污染；缓存里**不写源命令原文**（可能带 token），只写指纹与打码标签
-- `--json` 打印规范化后的行 —— 调源时最好用这个看字段到底有没有被认出来
-- 缓存位置可用 `A2_FIND_CACHE` 覆盖（测试/多实例）；`A2_TOR_DEBUG=1` 会打印完整源命令与源 stderr
+- 站点在你自己的 `~/.aria2/search-sites.conf` 里配置：`site=<名字>|<URL 模板>`（HTML，自动抽磁力）
+  或 `site=<名字>|cmd:<命令>`（自写源，输出 JSON 行）；`websearch=` 供 `--discover` 用；
+- 过滤/排序在搜索侧：电影分类全留、剧集要「整季/全集」且不是单集、噪音剔除，`--all` 全关；
+  `--res` / `--min-seeds`（seeds 未知的行不参与）/ `--prefer` 可叠加；
+- **没有缓存、没有序号**：磁力随 `--json` 给出，选中后交给 `a2 add --dir … --verify`。
 
-## 3. `a2 grab` — 按搜索结果下载
-
-```
-a2 grab <序号|标题片段|infohash|磁力> --dir DIR [-p] [-o 名字] [--no-verify]
-```
-
-- 序号支持 `1,3,5` 与 `2-4`，按最近一次 find 的**视图**（过滤+排序后）取。
-- 也可以给标题片段（匹配标题或详情页 URL 子串）、infohash（32/40 位，缓存里有现成磁力就用，没有就自己拼）或完整磁力。
-- **默认先做真做种校验**：bt-metadata-only 从 DHT 拉真实元数据（`A2_TOR_VERIFY_TIMEOUT` 秒，默认 90），校验通过才下到 `--dir`；拉不到说明真没人做种（源的 seeds 数会撒谎），换一条或用 `--no-verify` 强下。
-- 校验产物落 `~/.aria2/tor-cache`（别指向你的媒体库目录，免得半成品混进去）。
-- **落点**：`--dir` 必填，与其他 `add` 一致；要按分类落子目录，由技能看那一行的 `cat`（源的分类或标题推断）
-  拼出目录后传进来。校验拿到的真实种子名只用于显示，不参与 a2 的任何判断。
-
-## 4. 任务查看
+## 3. 任务查看
 
 ```
 a2 ls          # 活动+等待（默认）；a2 ls -a 含已结束
@@ -95,7 +83,7 @@ a2 files <gid> # 任务内文件列表（BT 显示种子内全部文件，含未
 
 BT 任务 `files[0]` 可能是 RARBG.txt 之类小文件，`ls` 显示种子名而不是第一个文件（看 `bittorrent.info.name`）。
 
-## 5. 任务控制
+## 4. 任务控制
 
 ```
 a2 pause [force] <gid|all>     # force = 立即中断当前分片
@@ -104,14 +92,14 @@ a2 rm <gid|all>                # 移除任务（不删已下文件；已结束�
 a2 purge                       # 清空已结束列表
 ```
 
-## 6. 限速（本次运行有效）
+## 5. 限速（本次运行有效）
 
 ```
 a2 up 1M     # 上传限速
 a2 down 0    # 0 = 不限速
 ```
 
-## 7. AList 网盘助手（`a2-ls` / `a2-alist` / `a2-alist-dir` / `a2-aliyun`）
+## 6. AList 网盘助手（`a2-ls` / `a2-alist` / `a2-alist-dir` / `a2-aliyun`）
 
 前置：AList 服务在 `http://localhost:5244`；管理员密码读 `~/.alist/admin_password.txt`（没有则交互输入）；已挂载阿里云盘（AliyundriveOpen 驱动）。
 
@@ -124,17 +112,16 @@ a2 down 0    # 0 = 不限速
 
 AList 本身的安装/阿里云盘接入见本技能 `references/install-guide.md`（安装）、`references/aliyun-driver.md`（阿里云盘驱动）、`references/alist-api.md`（API），脚本为 `scripts/install-alist.sh` 与 `scripts/setup-aliyun.sh`。
 
-## 8. 环境变量（可覆盖默认行为）
+## 7. 环境变量（可覆盖默认行为）
 
 | 变量 | 默认 | 作用 |
 |---|---|---|
-| `A2_TOR_CMD` | a2.conf 的 `tor-source-cmd` | 搜索源命令（临时换源，优先级最高） |
-| `A2_TOR_TIMEOUT` | 60 | 单次调用源命令的超时（秒） |
-| `A2_TOR_CACHE_TTL` | 900 | find 缓存有效期（秒） |
-| `A2_TOR_VERIFY_TIMEOUT` | 90 | grab 元数据校验超时（秒） |
-| `A2_TOR_CACHE_DIR` | ~/.aria2/tor-cache | 元数据校验产物目录（别指向媒体库目录） |
-| `A2_TOR_DEBUG` | 空 | 1=打印完整源命令与源 stderr（命令可能含 token，谨慎） |
-| `A2_FIND_CACHE` | ~/.aria2/find-cache.json | 搜索缓存文件（测试/多实例） |
+| `A2_SITES_CONF` | ~/.aria2/search-sites.conf | **a2-search** 的站点配置（a2 不读） |
+| `A2_SEARCH_TIMEOUT` | 20 | 单次抓取超时（秒）；cmd 源上限是它的 3 倍 |
+| `A2_SEARCH_PROXY` | 空 | 给抓取指定代理，如 `http://127.0.0.1:7897` |
+| `A2_SEARCH_DEBUG` | 空 | 1=打印完整 cmd 源命令（可能含 token，谨慎） |
+| `A2_VERIFY_TIMEOUT` | 90 | `a2 add --verify` 的元数据校验超时（秒） |
+| `A2_VERIFY_DIR` | ~/.aria2/tor-cache | 校验任务临时目录（别指向媒体库目录） |
 | `A2_RC` | ~/.aria2/a2.conf | a2 自己的配置文件 |
 | `A2_CONF` | ~/.aria2/aria2.conf | aria2 配置（端口/密钥/下载目录的来源） |
 | `A2_SERVICE` | a2.conf 的 `service=` | 服务名（launchd / systemd unit / Windows 计划任务；只影响提示信息） |
@@ -147,11 +134,11 @@ AList 本身的安装/阿里云盘接入见本技能 `references/install-guide.m
 | `A2_ALLOW_CREATE` | 空 | 1=允许把目标目录创建在系统盘上（默认拒绝，防止外接盘没挂载时误写） |
 | `A2_FALLBACK_DIR` | 空 | 落点目录不可用时临时回退的下载目录（不设则拒绝启动） |
 
-## 9. 与裸 RPC 的分工（a2 不覆盖才走 RPC）
+## 8. 与裸 RPC 的分工（a2 不覆盖才走 RPC）
 
 a2 是"常用操作的封装"，以下能力它没暴露，需要 `scripts/aria2_cli.py` 或直接 curl（端口取 conf 的 `rpc-listen-port`）：
 - `select-file`：整季包只下指定集（见 SKILL.md §5.3 完整示例）；
-- `bt-metadata-only` + `bt-save-metadata`：定制元数据预校验（`a2 grab` 已内置一版）；
+- `bt-metadata-only` + `bt-save-metadata`：定制元数据预校验（`a2 add --verify` 已内置一版）；
 - `aria2.addTorrent` 传自定义 options；
 - `aria2.changeGlobalOption`：限速之外的全局选项；
 - 按需字段的 `tellStatus` / `getGlobalStat` / `getFiles`。
